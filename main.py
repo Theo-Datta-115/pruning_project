@@ -1,3 +1,17 @@
+"""
+My short term goals here: 
+- Re-run the paper results, validate them, validate their pipeline works
+- Set up an actual train pipeline that retrains on BERT data, and validate that it doesn't significantly change the results 
+    - Use the wiki data from BERT training, raw = load_dataset("wikipedia", "20220301.en", split="train")
+- Try adding a new L2 training objective on the model as a whole, see what happens
+- Add wandb logging, potentially
+- Test what it looks like to finetune on a pre-finetuned model versus a new model (i.e. does compressing while finetuning help, or should you compress post-tuning)
+
+Base command: 
+
+python main.py --model_name bert-base-uncased  --task_name qqp --constraint 0.5
+"""
+
 import argparse
 import logging
 import os
@@ -42,8 +56,16 @@ parser.add_argument("--task_name", type=str, required=True, choices=[
     "squad",
     "squad_v2",
 ])
-parser.add_argument("--ckpt_dir", type=str, required=True)
-parser.add_argument("--output_dir", type=str, default=None)
+parser.add_argument(
+    "--ckpt_dir",
+    type=str,
+    default=None,
+    help=(
+        "Path to the fine-tuned checkpoint directory. Defaults to "
+        "`checkpoints/<model_name>/<task_name>` if not provided."
+    ),
+)
+parser.add_argument("--output_dir", type=str, default="/n/netscratch/sham_lab/Everyone/tdatta/pruning/outputs/")
 parser.add_argument("--gpu", type=int, default=0)
 
 parser.add_argument("--metric", type=str, choices=[
@@ -64,6 +86,42 @@ def main():
     IS_SQUAD = "squad" in args.task_name
     IS_LARGE = "large" in args.model_name
     seq_len = 170 if IS_SQUAD else avg_seq_length(args.task_name)
+
+    if args.ckpt_dir is None:
+        default_ckpt_dir = os.path.join("/n/netscratch/sham_lab/Everyone/tdatta/pruning/checkpoints/", args.model_name, args.task_name)
+        logger.info(
+            "`--ckpt_dir` not provided; falling back to default path %s",
+            default_ckpt_dir,
+        )
+        args.ckpt_dir = default_ckpt_dir
+
+    args.ckpt_dir = os.path.abspath(args.ckpt_dir)
+
+    if not os.path.isdir(args.ckpt_dir):
+        raise FileNotFoundError(
+            f"Checkpoint directory '{args.ckpt_dir}' does not exist. "
+            "Populate it using `scripts/download_checkpoints.py` or provide "
+            "a custom `--ckpt_dir`."
+        )
+
+    config_path = os.path.join(args.ckpt_dir, "config.json")
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(
+            f"Checkpoint directory '{args.ckpt_dir}' is missing required file: config.json. "
+            "Re-download the checkpoint or ensure it conforms to the Hugging Face format."
+        )
+
+    weight_candidates = [
+        "pytorch_model.bin",
+        "pytorch_model.bin.index.json",
+        "model.safetensors",
+    ]
+    if not any(os.path.isfile(os.path.join(args.ckpt_dir, candidate)) for candidate in weight_candidates):
+        candidates_str = ", ".join(weight_candidates)
+        raise FileNotFoundError(
+            f"Checkpoint directory '{args.ckpt_dir}' is missing model weight files. Expected one of: {candidates_str}. "
+            "Re-download the checkpoint or ensure it conforms to the Hugging Face format."
+        )
 
     # Create the output directory
     if args.output_dir is None:
