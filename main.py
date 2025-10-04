@@ -44,6 +44,7 @@ from prune.rearrange import rearrange_mask
 from prune.rescale import rescale_mask
 from evaluate.nlp import test_accuracy
 from utils.schedule import get_pruning_schedule
+from learned_prune.trainable_masks import make_masks_trainable
 
 
 logger = logging.getLogger(__name__)
@@ -72,16 +73,6 @@ parser.add_argument(
 )
 parser.add_argument("--output_dir", type=str, default="/n/netscratch/sham_lab/Everyone/tdatta/pruning/outputs/")
 parser.add_argument("--gpu", type=int, default=0)
-
-parser.add_argument("--metric", type=str, choices=[
-    "mac",
-    "latency",
-], default="mac")
-parser.add_argument("--constraint", type=float, required=True,
-    help="MAC/latency constraint relative to the original model",
-)
-parser.add_argument("--mha_lut", type=str, default=None)
-parser.add_argument("--ffn_lut", type=str, default=None)
 parser.add_argument("--num_samples", type=int, default=2048)
 parser.add_argument("--seed", type=int, default=0)
 
@@ -134,8 +125,6 @@ def main():
             "outputs",
             args.model_name,
             args.task_name,
-            args.metric,
-            str(args.constraint),
             f"seed_{args.seed}",
         )
     os.makedirs(args.output_dir, exist_ok=True)
@@ -211,9 +200,16 @@ def main():
     # Search the optimal mask
 
     print("pruning not yet implemented")
-    head_mask = full_head_mask
-    ffn_intermediate_mask = full_ffn_intermediate_mask
-    ffn_output_mask = full_ffn_output_mask
+    mask_handles = make_masks_trainable(
+        model,
+        head_mask=full_head_mask,
+        ffn_intermediate_mask=full_ffn_intermediate_mask,
+        ffn_output_mask=full_ffn_output_mask,
+    )
+
+    head_mask = mask_handles.head_mask.detach()
+    ffn_intermediate_mask = mask_handles.ffn_intermediate_mask.detach()
+    ffn_output_mask = mask_handles.ffn_output_mask.detach()
 
     # Print the pruning time
     end = time.time()
@@ -225,9 +221,9 @@ def main():
     logger.info(f"{args.task_name} Test accuracy: {test_acc:.4f}")
 
     # Save the masks
-    torch.save(head_mask, os.path.join(args.output_dir, "head_mask.pt"))
-    torch.save(ffn_intermediate_mask, os.path.join(args.output_dir, "ffn_intermediate_mask.pt"))
-    torch.save(ffn_output_mask, os.path.join(args.output_dir, "ffn_output_mask.pt"))
+    torch.save(head_mask.cpu(), os.path.join(args.output_dir, "head_mask.pt"))
+    torch.save(ffn_intermediate_mask.cpu(), os.path.join(args.output_dir, "ffn_intermediate_mask.pt"))
+    torch.save(ffn_output_mask.cpu(), os.path.join(args.output_dir, "ffn_output_mask.pt"))
 
 if __name__ == "__main__":
     main()
