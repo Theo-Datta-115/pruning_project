@@ -7,22 +7,6 @@ checkpoint folder will contain the `config.json`, `pytorch_model.bin`, and
 associated tokenizer files, making it straightforward to run the pruning
 pipeline offline.
 
-Examples
---------
-Download every supported task for both models into `checkpoints/`:
-
-```
-python scripts/download_checkpoints.py
-```
-
-Download only QQP for BERT-base and DistilBERT into a custom directory:
-
-```
-python scripts/download_checkpoints.py --tasks qqp --output-dir ./my_ckpts
-```
-
-If you have a private model that requires authentication, pass `--hf-token`.
-
 """
 
 import argparse
@@ -33,6 +17,7 @@ from pathlib import Path
 from typing import Dict, Iterable, Literal
 
 from transformers import (
+    AutoModel,
     AutoModelForQuestionAnswering,
     AutoModelForSequenceClassification,
     AutoTokenizer,
@@ -193,6 +178,45 @@ def download_checkpoint(
     )
 
 
+def download_base_models(
+    model_name: str,
+    target_root: Path,
+    *,
+    cache_dir: Path | None = None,
+    hf_token: str | None = None,
+) -> None:
+    hf_kwargs = {
+        "cache_dir": cache_dir,
+        "use_auth_token": hf_token,
+    }
+    hf_kwargs = {k: v for k, v in hf_kwargs.items() if v is not None}
+
+    base_spec = {
+        "sequence_classification": AutoModelForSequenceClassification,
+        "question_answering": AutoModelForQuestionAnswering,
+    }
+
+    for task_type, model_cls in base_spec.items():
+        target_dir = target_root / f"base_{task_type}"
+        ensure_clean_dir(target_dir, overwrite=True)
+
+        logging.info("Downloading base %s weights for %s", task_type, model_name)
+        model = model_cls.from_pretrained(model_name, **hf_kwargs)
+        model.save_pretrained(target_dir)
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, **hf_kwargs)
+        tokenizer.save_pretrained(target_dir)
+
+        save_metadata(
+            target_dir,
+            {
+                "base_model": model_name,
+                "task": f"base_{task_type}",
+                "repository": model_name,
+                "task_type": task_type,
+            },
+        )
+
 
 def main() -> None:
     args = parse_args()
@@ -207,6 +231,14 @@ def main() -> None:
                 "Model %s has no predefined repository mapping; downloads will fall back to the base identifier.",
                 model_name,
             )
+
+        base_root_dir = output_dir / model_name
+        download_base_models(
+            model_name,
+            base_root_dir,
+            cache_dir=cache_dir,
+            hf_token=args.hf_token,
+        )
 
         for task in args.tasks:
             task_type = default_tasks[task]

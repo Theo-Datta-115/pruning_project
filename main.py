@@ -11,9 +11,10 @@ My short term goals here:
 
 Base command: 
 
-python main.py --model_name bert-base-uncased  --task_name qqp 
+python main.py --model_name bert-base-uncased  --task_name qqp --use_base_model True
 python baseline.py --model_name bert-base-uncased  --task_name qqp --constraint 0.5
 python scripts/analyze_param_usage.py /n/netscratch/sham_lab/Everyone/tdatta/pruning/checkpoints/bert-base-uncased/qqp
+python scripts/download_checkpoints.py
 
 """
 
@@ -45,6 +46,7 @@ from prune.rescale import rescale_mask
 from evaluate.nlp import test_accuracy
 from utils.schedule import get_pruning_schedule
 from learned_prune.trainable_masks import make_masks_trainable
+from utils.model_loader import load_model_and_tokenizer
 
 
 logger = logging.getLogger(__name__)
@@ -75,6 +77,11 @@ parser.add_argument("--output_dir", type=str, default="/n/netscratch/sham_lab/Ev
 parser.add_argument("--gpu", type=int, default=0)
 parser.add_argument("--num_samples", type=int, default=2048)
 parser.add_argument("--seed", type=int, default=0)
+parser.add_argument(
+    "--use_base_model",
+    action="store_true",
+    help="Load the base pretrained weights for `--model_name` instead of a fine-tuned checkpoint.",
+)
 
 
 def main():
@@ -83,41 +90,14 @@ def main():
     IS_LARGE = "large" in args.model_name
     seq_len = 170 if IS_SQUAD else avg_seq_length(args.task_name)
 
-    if args.ckpt_dir is None:
-        default_ckpt_dir = os.path.join("/n/netscratch/sham_lab/Everyone/tdatta/pruning/checkpoints/", args.model_name, args.task_name)
-        logger.info(
-            "`--ckpt_dir` not provided; falling back to default path %s",
-            default_ckpt_dir,
-        )
-        args.ckpt_dir = default_ckpt_dir
-
-    args.ckpt_dir = os.path.abspath(args.ckpt_dir)
-
-    if not os.path.isdir(args.ckpt_dir):
-        raise FileNotFoundError(
-            f"Checkpoint directory '{args.ckpt_dir}' does not exist. "
-            "Populate it using `scripts/download_checkpoints.py` or provide "
-            "a custom `--ckpt_dir`."
-        )
-
-    config_path = os.path.join(args.ckpt_dir, "config.json")
-    if not os.path.isfile(config_path):
-        raise FileNotFoundError(
-            f"Checkpoint directory '{args.ckpt_dir}' is missing required file: config.json. "
-            "Re-download the checkpoint or ensure it conforms to the Hugging Face format."
-        )
-
-    weight_candidates = [
-        "pytorch_model.bin",
-        "pytorch_model.bin.index.json",
-        "model.safetensors",
-    ]
-    if not any(os.path.isfile(os.path.join(args.ckpt_dir, candidate)) for candidate in weight_candidates):
-        candidates_str = ", ".join(weight_candidates)
-        raise FileNotFoundError(
-            f"Checkpoint directory '{args.ckpt_dir}' is missing model weight files. Expected one of: {candidates_str}. "
-            "Re-download the checkpoint or ensure it conforms to the Hugging Face format."
-        )
+    default_root = "/n/netscratch/sham_lab/Everyone/tdatta/pruning/checkpoints/"
+    config, model, tokenizer, model_source = load_model_and_tokenizer(
+        model_name=args.model_name,
+        task_name=args.task_name,
+        ckpt_dir=args.ckpt_dir,
+        use_base_model=args.use_base_model,
+        default_root=default_root,
+    )
 
     # Create the output directory
     if args.output_dir is None:
@@ -147,15 +127,6 @@ def main():
     logger.info(f"Seed number: {args.seed}")
 
     # Load the finetuned model and the corresponding tokenizer
-    config = AutoConfig.from_pretrained(args.ckpt_dir)
-    model_generator = AutoModelForQuestionAnswering if IS_SQUAD else AutoModelForSequenceClassification
-    model = model_generator.from_pretrained(args.ckpt_dir, config=config)
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_name,
-        use_fast=True,
-        use_auth_token=None,
-    )
-
     # Load the training dataset
     if IS_SQUAD:
         training_dataset = squad_dataset(
