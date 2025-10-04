@@ -7,7 +7,7 @@ from evaluate.squad import eval_squad_acc
 
 
 @torch.no_grad()
-def test_accuracy(model, head_mask, neuron_mask, tokenizer, task_name):
+def test_accuracy(model, head_mask, ffn_intermediate_mask, ffn_output_mask, tokenizer, task_name):
     IS_SQUAD = "squad" in task_name
 
     test_batch_size = 32 if IS_SQUAD else 128
@@ -21,7 +21,8 @@ def test_accuracy(model, head_mask, neuron_mask, tokenizer, task_name):
         acc = eval_squad_acc(
             model,
             head_mask,
-            neuron_mask,
+            ffn_intermediate_mask, 
+            ffn_output_mask,
             test_dataloader,
             eval_dataset,
             eval_examples,
@@ -38,7 +39,8 @@ def test_accuracy(model, head_mask, neuron_mask, tokenizer, task_name):
         acc = eval_glue_acc(
             model,
             head_mask,
-            neuron_mask,
+            ffn_intermediate_mask, 
+            ffn_output_mask,
             test_dataloader,
             task_name,
         )

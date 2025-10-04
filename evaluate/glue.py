@@ -1,17 +1,17 @@
 import torch
 from datasets import load_metric
-
 from utils.arch import apply_neuron_mask
 from dataset.glue import target_dev_metric
 
 
 @torch.no_grad()
-def eval_glue_acc(model, head_mask, neuron_mask, dataloader, task_name):
+def eval_glue_acc(model, head_mask, ffn_intermediate_mask, ffn_output_mask, dataloader, task_name):
     IS_STSB = model.num_labels == 1
     metric = load_metric("glue", task_name)
 
     model.eval()
-    handles = apply_neuron_mask(model, neuron_mask)
+    handles_int = apply_neuron_mask(model, ffn_intermediate_mask, type="ffn_1")
+    handles_out = apply_neuron_mask(model, ffn_output_mask, type="ffn_2")
     for batch in dataloader:
         for k, v in batch.items():
             batch[k] = v.to("cuda", non_blocking=True)
@@ -25,7 +25,9 @@ def eval_glue_acc(model, head_mask, neuron_mask, dataloader, task_name):
             predictions=predictions,
             references=batch["labels"],
         )
-    for handle in handles:
+    for handle in handles_int:
+        handle.remove()
+    for handle in handles_out:
         handle.remove()
 
     eval_results = metric.compute()

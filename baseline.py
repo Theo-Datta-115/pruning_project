@@ -7,14 +7,11 @@ My short term goals here:
 - Add wandb logging, potentially
 - Test what it looks like to finetune on a pre-finetuned model versus a new model (i.e. does compressing while finetuning help, or should you compress post-tuning)
 - consider adding wandb for training
-- there is a hook (non-gradient, short-term) masking emthod implemented in utils and evaluate. This is fine for my purposes, as long as I actually train the model with new NN parameters, and then extract them and pass them to the original model architecture at test time. To do this, I should implement the ability to use hooks on both ouput and input ffn layers.
 
 Base command: 
 
-python main.py --model_name bert-base-uncased  --task_name qqp 
-python baseline.py --model_name bert-base-uncased  --task_name qqp --constraint 0.5
+python main.py --model_name bert-base-uncased  --task_name qqp --constraint 0.5
 python scripts/analyze_param_usage.py /n/netscratch/sham_lab/Everyone/tdatta/pruning/checkpoints/bert-base-uncased/qqp
-
 """
 
 import argparse
@@ -166,7 +163,7 @@ def main():
         use_fast=True,
         use_auth_token=None,
     )
-
+    
     # Load the training dataset
     if IS_SQUAD:
         training_dataset = squad_dataset(
@@ -202,32 +199,90 @@ def main():
 
     # Prepare the model
     model = model.cuda()
+    model.eval()
+    for param in model.parameters():
+        param.requires_grad_(False)
 
     full_head_mask = torch.ones(config.num_hidden_layers, config.num_attention_heads).cuda()
     full_ffn_intermediate_mask = torch.ones(config.num_hidden_layers, config.hidden_size).cuda()
-    full_ffn_output_mask = torch.ones(config.num_hidden_layers, config.intermediate_size).cuda()
+    full_neuron_mask = torch.ones(config.num_hidden_layers, config.intermediate_size).cuda()
 
     start = time.time()
     # Search the optimal mask
+    head_grads, neuron_grads = collect_mask_grads(
+        model,
+        full_head_mask,
+        full_neuron_mask,
+        sample_dataloader,
+    )
+    teacher_constraint = get_pruning_schedule(target=args.constraint, num_iter=2)[0]
+    if args.metric == "mac":
+        teacher_head_mask, teacher_neuron_mask = search_mac(
+            config,
+            head_grads,
+            neuron_grads,
+            seq_len,
+            teacher_constraint,
+        )
+        head_mask, neuron_mask = search_mac(
+            config,
+            head_grads,
+            neuron_grads,
+            seq_len,
+            args.constraint,
+        )
+        pruned_mac, orig_mac = compute_mask_mac(head_mask, neuron_mask, seq_len, config.hidden_size)
+        logger.info(f"Pruned Model MAC: {pruned_mac / orig_mac * 100.0:.2f} %")
+    elif args.metric == "latency":
+        mha_lut = torch.load(args.mha_lut)
+        ffn_lut = torch.load(args.ffn_lut)
+        teacher_head_mask, teacher_neuron_mask = search_latency(
+            config,
+            head_grads,
+            neuron_grads,
+            teacher_constraint,
+            mha_lut,
+            ffn_lut,
+        )
+        head_mask, neuron_mask = search_latency(
+            config,
+            head_grads,
+            neuron_grads,
+            args.constraint,
+            mha_lut,
+            ffn_lut,
+        )
+        pruned_latency = estimate_latency(mha_lut, ffn_lut, head_mask, neuron_mask)
+        logger.info(f"Pruned Model Latency: {pruned_latency:.2f} ms")
 
-    print("pruning not yet implemented")
-    head_mask = full_head_mask
-    ffn_intermediate_mask = full_ffn_intermediate_mask
-    ffn_output_mask = full_ffn_output_mask
+    # Rearrange the mask
+    head_mask = rearrange_mask(head_mask, head_grads)
+    neuron_mask = rearrange_mask(neuron_mask, neuron_grads)
+
+    # Rescale the mask by solving a least squares problem
+    head_mask, neuron_mask = rescale_mask(
+        model,
+        config,
+        teacher_head_mask,
+        teacher_neuron_mask,
+        head_mask,
+        neuron_mask,
+        sample_dataloader,
+        classification_task=not IS_SQUAD,
+    )
 
     # Print the pruning time
     end = time.time()
-
     logger.info(f"{args.task_name} Pruning time (s): {end - start}")
 
     # Evaluate the accuracy
-    test_acc = test_accuracy(model, head_mask, ffn_intermediate_mask, ffn_output_mask, tokenizer, args.task_name)
+    test_acc = test_accuracy(model, head_mask, full_ffn_intermediate_mask, neuron_mask, tokenizer, args.task_name)
     logger.info(f"{args.task_name} Test accuracy: {test_acc:.4f}")
 
     # Save the masks
     torch.save(head_mask, os.path.join(args.output_dir, "head_mask.pt"))
-    torch.save(ffn_intermediate_mask, os.path.join(args.output_dir, "ffn_intermediate_mask.pt"))
-    torch.save(ffn_output_mask, os.path.join(args.output_dir, "ffn_output_mask.pt"))
+    torch.save(neuron_mask, os.path.join(args.output_dir, "neuron_mask.pt"))
+
 
 if __name__ == "__main__":
     main()

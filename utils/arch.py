@@ -39,7 +39,6 @@ def get_ffn1(model, index):
     ffn1 = layer.intermediate
     return ffn1
 
-
 def get_ffn2(model, index):
     layer = get_layers(model)[index]
     ffn2 = layer.output
@@ -56,20 +55,32 @@ def get_classifier(model):
 
 
 def register_mask(module, mask):
-    hook = lambda _, inputs: (inputs[0] * mask, inputs[1])
+    def hook(_, inputs):
+        hidden_states = inputs[0]
+        mask_view = mask.reshape(1, 1, -1).to(hidden_states.device, hidden_states.dtype)
+        masked_hidden = hidden_states * mask_view
+        if len(inputs) == 1:
+            return (masked_hidden,)
+        return (masked_hidden,) + tuple(inputs[1:])
+
     handle = module.register_forward_pre_hook(hook)
     return handle
 
 
-def apply_neuron_mask(model, neuron_mask):
+def apply_neuron_mask(model, neuron_mask, type="ffn_2"):
     num_hidden_layers = neuron_mask.shape[0]
     handles = []
     for layer_idx in range(num_hidden_layers):
-        ffn2 = get_ffn2(model, layer_idx)
-        handle = register_mask(ffn2, neuron_mask[layer_idx])
-        handles.append(handle)
-    return handles
+        if type == "ffn_1":
+            ffn = get_ffn1(model, layer_idx)
+        elif type == "ffn_2":
+            ffn = get_ffn2(model, layer_idx)
+        else:
+            raise ValueError(f"Unknown FFN mask type: {type}")
 
+        mask_row = neuron_mask[layer_idx].reshape(-1)
+        handles.append(register_mask(ffn, mask_row))
+    return handles
 
 class MaskNeurons:
     def __init__(self, model, neuron_mask):
