@@ -11,7 +11,7 @@ My short term goals here:
 
 Base command: 
 
-python main.py --model_name bert-base-uncased  --task_name qqp --use_base_model True
+python main.py --model_name bert-base-uncased  --task_name qqp --use_base_model
 python baseline.py --model_name bert-base-uncased  --task_name qqp --constraint 0.5
 python scripts/analyze_param_usage.py /n/netscratch/sham_lab/Everyone/tdatta/pruning/checkpoints/bert-base-uncased/qqp
 python scripts/download_checkpoints.py
@@ -82,6 +82,8 @@ parser.add_argument(
     action="store_true",
     help="Load the base pretrained weights for `--model_name` instead of a fine-tuned checkpoint.",
 )
+parser.add_argument("--num_epochs", type=int, default=1)
+parser.add_argument('--log_loss_every', type=int, default=5)
 
 
 def main():
@@ -163,24 +165,89 @@ def main():
     # Prepare the model
     model = model.cuda()
 
-    full_head_mask = torch.ones(config.num_hidden_layers, config.num_attention_heads).cuda()
-    full_ffn_intermediate_mask = torch.ones(config.num_hidden_layers, config.hidden_size).cuda()
-    full_ffn_output_mask = torch.ones(config.num_hidden_layers, config.intermediate_size).cuda()
+    full_head_mask = torch.randn(config.num_hidden_layers, config.num_attention_heads).cuda()
+    full_ffn_intermediate_mask = torch.randn(config.num_hidden_layers, config.hidden_size).cuda()
+    full_ffn_output_mask = torch.randn(config.num_hidden_layers, config.intermediate_size).cuda()
 
-    start = time.time()
-    # Search the optimal mask
 
-    print("pruning not yet implemented")
-    mask_handles = make_masks_trainable(
+    masked_model = make_masks_trainable(
         model,
         head_mask=full_head_mask,
         ffn_intermediate_mask=full_ffn_intermediate_mask,
         ffn_output_mask=full_ffn_output_mask,
     )
 
-    head_mask = mask_handles.head_mask.detach()
-    ffn_intermediate_mask = mask_handles.ffn_intermediate_mask.detach()
-    ffn_output_mask = mask_handles.ffn_output_mask.detach()
+    mask_params = [
+        param
+        for param in (
+            masked_model.head_mask,
+            masked_model.ffn_intermediate_mask,
+            masked_model.ffn_output_mask,
+        )
+        if param is not None
+    ]
+    mask_param_ids = {id(param) for param in mask_params}
+    base_params = [
+        param for param in model.parameters() if id(param) not in mask_param_ids
+    ]
+
+    masked_train_dataloader = DataLoader(
+        training_dataset,
+        batch_size=256,
+        shuffle=True,
+        collate_fn=collate_fn,
+        pin_memory=True,
+    )
+
+    # Moodel finetuning
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": base_params, "lr": 2e-5, "weight_decay": 0.01},
+            {"params": mask_params, "lr": 1e-2, "weight_decay": 0.0},
+        ]
+    )
+    model.train()
+    global_step = 0
+
+    m = model.trainable_ffn_intermediate_mask
+    print("requires_grad:", m.requires_grad)
+    ids = {id(p) for g in optimizer.param_groups for p in g['params']}
+    print("in optimizer:", id(m) in ids)
+
+    for epoch in range(args.num_epochs):
+        epoch_loss = 0.0
+        for batch in masked_train_dataloader:
+            for key, value in batch.items():
+                batch[key] = value.to("cuda", non_blocking=True)
+
+            outputs = model(**batch)
+            
+            masks = torch.sigmoid(model.trainable_ffn_intermediate_mask)
+            sparsity_loss = torch.mean(masks)# + torch.mean(model.trainable_ffn_output_mask) + torch.mean(model.trainable_head_mask)
+            
+            
+            quantization_loss = torch.mean(-torch.log(masks) * masks - torch.log(1 - masks) * (1 - masks))
+            # quantization_loss = (4 * masks * (1 - masks)).mean()
+
+            loss = outputs.loss + sparsity_loss * 0.1 + quantization_loss * 0.01
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+            epoch_loss += loss.item()
+            global_step += 1
+
+            if args.log_loss_every > 0 and global_step % args.log_loss_every == 0:
+                logger.info(f"Step {global_step} of {len(masked_train_dataloader)}: training loss {outputs.loss.item():.4f}, sparsity loss {sparsity_loss.item():.4f}")
+                print(torch.sigmoid(model.trainable_ffn_intermediate_mask))
+
+    model.eval()
+
+    start = time.time()
+
+    head_mask = masked_model.head_mask.detach()
+    ffn_intermediate_mask = masked_model.ffn_intermediate_mask.detach()
+    ffn_output_mask = masked_model.ffn_output_mask.detach()
 
     # Print the pruning time
     end = time.time()

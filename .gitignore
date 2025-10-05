@@ -1,2 +1,7 @@
 __pycache__
 outputs
+playground.py
+*.npy
+
+checkpoint/
+data/
