@@ -84,6 +84,9 @@ parser.add_argument(
 )
 parser.add_argument("--num_epochs", type=int, default=1)
 parser.add_argument('--log_loss_every', type=int, default=5)
+parser.add_argument('--prune', action='store_true', help='Enable pruning with trainable masks')
+parser.add_argument('--wandb', type=str, default=None, help='W&B project name (enables W&B logging if provided)')
+parser.add_argument('--name', type=str, default=None, help='W&B run name (defaults to auto-generated)')
 
 
 def main():
@@ -91,6 +94,18 @@ def main():
     IS_SQUAD = "squad" in args.task_name
     IS_LARGE = "large" in args.model_name
     seq_len = 170 if IS_SQUAD else avg_seq_length(args.task_name)
+
+    # Initialize wandb if enabled
+    if args.wandb:
+        import wandb
+        wandb.init(
+            project=args.wandb,
+            name=args.name,
+            config=vars(args),
+        )
+        logger.info(f"Weights & Biases logging enabled (project: {args.wandb})")
+    else:
+        wandb = None
 
     default_root = "/n/netscratch/sham_lab/Everyone/tdatta/pruning/checkpoints/"
     config, model, tokenizer, model_source = load_model_and_tokenizer(
@@ -165,31 +180,46 @@ def main():
     # Prepare the model
     model = model.cuda()
 
-    full_head_mask = torch.randn(config.num_hidden_layers, config.num_attention_heads).cuda()
-    full_ffn_intermediate_mask = torch.randn(config.num_hidden_layers, config.hidden_size).cuda()
-    full_ffn_output_mask = torch.randn(config.num_hidden_layers, config.intermediate_size).cuda()
+    if args.prune:
+        logger.info("Pruning enabled - using trainable masks")
+        # more or less only plays with intermediate layers
+        full_head_mask = torch.ones(config.num_hidden_layers, config.num_attention_heads).cuda()
+        full_ffn_intermediate_mask = torch.ones(config.num_hidden_layers, config.hidden_size).cuda()
+        full_ffn_output_mask = torch.ones(config.num_hidden_layers, config.intermediate_size).cuda()
 
-
-    masked_model = make_masks_trainable(
-        model,
-        head_mask=full_head_mask,
-        ffn_intermediate_mask=full_ffn_intermediate_mask,
-        ffn_output_mask=full_ffn_output_mask,
-    )
-
-    mask_params = [
-        param
-        for param in (
-            masked_model.head_mask,
-            masked_model.ffn_intermediate_mask,
-            masked_model.ffn_output_mask,
+        masked_model = make_masks_trainable(
+            model,
+            head_mask=full_head_mask,
+            ffn_intermediate_mask=full_ffn_intermediate_mask,
+            ffn_output_mask=full_ffn_output_mask,
         )
-        if param is not None
-    ]
-    mask_param_ids = {id(param) for param in mask_params}
-    base_params = [
-        param for param in model.parameters() if id(param) not in mask_param_ids
-    ]
+
+        # Freeze the masks after they've been converted to parameters
+        if masked_model.head_mask is not None:
+            masked_model.head_mask.requires_grad = False
+        if masked_model.ffn_intermediate_mask is not None:
+            masked_model.ffn_intermediate_mask.requires_grad = False
+        if masked_model.ffn_output_mask is not None:
+            masked_model.ffn_output_mask.requires_grad = False
+
+        # Collect mask parameters (even though they're frozen, we need to exclude them from base_params)
+        mask_params = [
+            param
+            for param in (
+                masked_model.head_mask,
+                masked_model.ffn_intermediate_mask,
+                masked_model.ffn_output_mask,
+            )
+            if param is not None
+        ]
+        mask_param_ids = {id(param) for param in mask_params}
+        
+        # Base params are everything except the masks
+        base_params = [param for param in model.parameters() if id(param) not in mask_param_ids]
+    else:
+        logger.info("Pruning disabled - training without masks")
+        mask_params = []
+        base_params = [param for param in model.parameters() if param.requires_grad]
 
     masked_train_dataloader = DataLoader(
         training_dataset,
@@ -202,19 +232,29 @@ def main():
     # Moodel finetuning
     optimizer = torch.optim.AdamW(
         [
-            {"params": base_params, "lr": 2e-5, "weight_decay": 0.01},
+            {"params": base_params, "lr": 5e-5, "weight_decay": 0.01},
             {"params": mask_params, "lr": 1e-2, "weight_decay": 0.0},
         ]
     )
     model.train()
     global_step = 0
 
-    m = model.trainable_ffn_intermediate_mask
-    print("requires_grad:", m.requires_grad)
-    ids = {id(p) for g in optimizer.param_groups for p in g['params']}
-    print("in optimizer:", id(m) in ids)
+    if args.prune:
+        m = model.trainable_ffn_intermediate_mask
+        print("requires_grad:", m.requires_grad)
+        ids = {id(p) for g in optimizer.param_groups for p in g['params']}
+        print("in optimizer:", id(m) in ids)
+    
+    # Track a base model parameter to verify it's learning
+    sample_param = None
+    for name, param in model.named_parameters():
+        if 'trainable' not in name and 'weight' in name and param.requires_grad:
+            sample_param = (name, param.clone().detach())
+            logger.info(f"Tracking param: {name}, initial mean: {param.data.mean().item():.6f}, std: {param.data.std().item():.6f}")
+            break
 
     for epoch in range(args.num_epochs):
+        model.train()
         epoch_loss = 0.0
         for batch in masked_train_dataloader:
             for key, value in batch.items():
@@ -222,15 +262,20 @@ def main():
 
             outputs = model(**batch)
             
-            masks = torch.sigmoid(model.trainable_ffn_intermediate_mask)
-            sparsity_loss = torch.mean(masks)# + torch.mean(model.trainable_ffn_output_mask) + torch.mean(model.trainable_head_mask)
-            
-            
-            quantization_loss = torch.mean(-torch.log(masks) * masks - torch.log(1 - masks) * (1 - masks))
-            # quantization_loss = (4 * masks * (1 - masks)).mean()
+            if args.prune:
+                masks = model.trainable_ffn_intermediate_mask #sigmoid
+                sparsity_loss = torch.mean(masks)# + torch.mean(model.trainable_ffn_output_mask) + torch.mean(model.trainable_head_mask)
+                
+                # Information-based quantization loss
+                quantization_loss = torch.mean(-torch.log(masks) * masks - torch.log(1 - masks) * (1 - masks))
+                # quantization_loss = (4 * masks * (1 - masks)).mean()
+            else:
+                sparsity_loss = torch.tensor(0.0)
+                quantization_loss = torch.tensor(0.0)
 
-            loss = outputs.loss + sparsity_loss * 0.1 + quantization_loss * 0.01
+            loss = outputs.loss # + sparsity_loss * 0.1 + quantization_loss * 0.01
             loss.backward()
+            
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
@@ -238,30 +283,86 @@ def main():
             global_step += 1
 
             if args.log_loss_every > 0 and global_step % args.log_loss_every == 0:
-                logger.info(f"Step {global_step} of {len(masked_train_dataloader)}: training loss {outputs.loss.item():.4f}, sparsity loss {sparsity_loss.item():.4f}")
-                print(torch.sigmoid(model.trainable_ffn_intermediate_mask))
+                if args.prune:
+                    logger.info(f"Step {global_step}: training loss {outputs.loss.item():.4f}, sparsity loss {sparsity_loss.item():.4f}")
+                    logger.info(f"Mask stats - min: {masks.min().item():.4f}, max: {masks.max().item():.4f}, mean: {masks.mean().item():.4f}")
+                    
+                    if args.wandb:
+                        wandb.log({
+                            "train/loss": outputs.loss.item(),
+                            "train/sparsity_loss": sparsity_loss.item(),
+                            "train/quantization_loss": quantization_loss.item(),
+                            "train/total_loss": loss.item(),
+                            "masks/min": masks.min().item(),
+                            "masks/max": masks.max().item(),
+                            "masks/mean": masks.mean().item(),
+                            "masks/std": masks.std().item(),
+                            "global_step": global_step,
+                            "epoch": epoch,
+                        })
+                else:
+                    logger.info(f"Step {global_step}: training loss {outputs.loss.item():.4f}")
+                    
+                    if args.wandb:
+                        wandb.log({
+                            "train/loss": outputs.loss.item(),
+                            "global_step": global_step,
+                            "epoch": epoch,
+                        })
+
+        # Evaluate at the end of each epoch
+        model.eval()
+        
+        if args.prune:
+            head_mask = masked_model.head_mask.detach()
+            ffn_intermediate_mask = masked_model.ffn_intermediate_mask.detach()
+            ffn_output_mask = masked_model.ffn_output_mask.detach()
+        else:
+            head_mask = None
+            ffn_intermediate_mask = None
+            ffn_output_mask = None
+        
+        epoch_test_acc = test_accuracy(model, head_mask, ffn_intermediate_mask, ffn_output_mask, tokenizer, args.task_name)
+        logger.info(f"Epoch {epoch + 1}/{args.num_epochs} - Test accuracy: {epoch_test_acc:.4f}")
+        
+        if args.wandb:
+            wandb.log({
+                "eval/accuracy": epoch_test_acc,
+                "epoch": epoch,
+                "global_step": global_step,
+            })
 
     model.eval()
 
     start = time.time()
 
-    head_mask = masked_model.head_mask.detach()
-    ffn_intermediate_mask = masked_model.ffn_intermediate_mask.detach()
-    ffn_output_mask = masked_model.ffn_output_mask.detach()
+    if args.prune:
+        head_mask = masked_model.head_mask.detach()
+        ffn_intermediate_mask = masked_model.ffn_intermediate_mask.detach()
+        ffn_output_mask = masked_model.ffn_output_mask.detach()
+    else:
+        # No masks - use None for evaluation
+        head_mask = None
+        ffn_intermediate_mask = None
+        ffn_output_mask = None
 
     # Print the pruning time
     end = time.time()
 
-    logger.info(f"{args.task_name} Pruning time (s): {end - start}")
+    logger.info(f"{args.task_name} Training time (s): {end - start}")
 
     # Evaluate the accuracy
     test_acc = test_accuracy(model, head_mask, ffn_intermediate_mask, ffn_output_mask, tokenizer, args.task_name)
     logger.info(f"{args.task_name} Test accuracy: {test_acc:.4f}")
+    
+    if args.wandb:
+        wandb.finish()
 
-    # Save the masks
-    torch.save(head_mask.cpu(), os.path.join(args.output_dir, "head_mask.pt"))
-    torch.save(ffn_intermediate_mask.cpu(), os.path.join(args.output_dir, "ffn_intermediate_mask.pt"))
-    torch.save(ffn_output_mask.cpu(), os.path.join(args.output_dir, "ffn_output_mask.pt"))
+    # Save the masks (only if pruning is enabled)
+    if args.prune:
+        torch.save(head_mask.cpu(), os.path.join(args.output_dir, "head_mask.pt"))
+        torch.save(ffn_intermediate_mask.cpu(), os.path.join(args.output_dir, "ffn_intermediate_mask.pt"))
+        torch.save(ffn_output_mask.cpu(), os.path.join(args.output_dir, "ffn_output_mask.pt"))
 
 if __name__ == "__main__":
     main()

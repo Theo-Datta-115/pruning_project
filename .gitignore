@@ -3,5 +3,4 @@ outputs
 playground.py
 *.npy
 
-checkpoint/
-data/
+hw2/
