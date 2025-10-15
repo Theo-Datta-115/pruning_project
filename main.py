@@ -82,10 +82,10 @@ parser.add_argument(
     action="store_true",
     help="Load the base pretrained weights for `--model_name` instead of a fine-tuned checkpoint.",
 )
-parser.add_argument("--num_epochs", type=int, default=1)
+parser.add_argument("--num_epochs", type=int, default=5)
 parser.add_argument('--log_loss_every', type=int, default=5)
 parser.add_argument('--prune', action='store_true', help='Enable pruning with trainable masks')
-parser.add_argument('--wandb', type=str, default=None, help='W&B project name (enables W&B logging if provided)')
+parser.add_argument('--wandb', action='store_true', help='W&B project name (enables W&B logging if provided)')
 parser.add_argument('--name', type=str, default=None, help='W&B run name (defaults to auto-generated)')
 
 
@@ -99,11 +99,12 @@ def main():
     if args.wandb:
         import wandb
         wandb.init(
-            project=args.wandb,
-            name=args.name,
+            entity="harvardml",
+            project="td-pruning",
+            name=f"{args.model_name}_{args.task_name}_{args.name}",
             config=vars(args),
         )
-        logger.info(f"Weights & Biases logging enabled (project: {args.wandb})")
+        logger.info(f"Weights & Biases logging enabled (project: td-pruning)")
     else:
         wandb = None
 

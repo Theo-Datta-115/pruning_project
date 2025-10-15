@@ -4,3 +4,6 @@ playground.py
 *.npy
 
 hw2/
+logfiles/
+asynch.sh
+wandb/

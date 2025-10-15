@@ -68,6 +68,10 @@ def register_mask(module, mask):
 
 
 def apply_neuron_mask(model, neuron_mask, type="ffn_2"):
+    # If no mask is provided, return empty handles (no masking)
+    if neuron_mask is None:
+        return []
+    
     num_hidden_layers = neuron_mask.shape[0]
     handles = []
     for layer_idx in range(num_hidden_layers):
