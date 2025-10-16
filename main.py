@@ -82,7 +82,7 @@ parser.add_argument(
     action="store_true",
     help="Load the base pretrained weights for `--model_name` instead of a fine-tuned checkpoint.",
 )
-parser.add_argument("--num_epochs", type=int, default=5)
+parser.add_argument("--num_epochs", type=int, default=15)
 parser.add_argument('--log_loss_every', type=int, default=5)
 parser.add_argument('--prune', action='store_true', help='Enable pruning with trainable masks')
 parser.add_argument('--wandb', action='store_true', help='W&B project name (enables W&B logging if provided)')
@@ -91,6 +91,7 @@ parser.add_argument('--freeze', action='store_true', help='Freeze the model para
 parser.add_argument('--quantization_loss', type=float, default=0.01, help='Quantization loss weight')
 parser.add_argument('--sparsity_loss', type=float, default=0.1, help='Sparsity loss weight')
 parser.add_argument('--hard_init', action='store_true', help='Hard Initialization of the Masks')
+parser.add_argument('--masks_LR', type=float, default=1e-2, help='Learning rate for masks')
 
 def main():
     args = parser.parse_args()
@@ -243,7 +244,7 @@ def main():
     optimizer = torch.optim.AdamW(
         [
             {"params": base_params, "lr": 5e-5, "weight_decay": 0.01},
-            {"params": mask_params, "lr": 1e-2, "weight_decay": 0.0},
+            {"params": mask_params, "lr": args.masks_LR, "weight_decay": 0.0},
         ]
     )
     model.train()
@@ -334,9 +335,15 @@ def main():
         model.eval()
         
         if args.prune:
-            head_mask = masked_model.head_mask.detach()
-            ffn_intermediate_mask = masked_model.ffn_intermediate_mask.detach()
-            ffn_output_mask = masked_model.ffn_output_mask.detach()
+            # Convert continuous masks to binary: sigmoid(mask) >= 0.5 -> 1, else -> 0
+            head_mask_sigmoid = torch.sigmoid(masked_model.head_mask.detach())
+            head_mask = (head_mask_sigmoid >= 0.5).float()
+            
+            ffn_intermediate_mask_sigmoid = torch.sigmoid(masked_model.ffn_intermediate_mask.detach())
+            ffn_intermediate_mask = (ffn_intermediate_mask_sigmoid >= 0.5).float()
+            
+            ffn_output_mask_sigmoid = torch.sigmoid(masked_model.ffn_output_mask.detach())
+            ffn_output_mask = (ffn_output_mask_sigmoid >= 0.5).float()
         else:
             head_mask = None
             ffn_intermediate_mask = None
@@ -352,28 +359,7 @@ def main():
                 "global_step": global_step,
             })
 
-    model.eval()
-
-    start = time.time()
-
-    if args.prune:
-        head_mask = masked_model.head_mask.detach()
-        ffn_intermediate_mask = masked_model.ffn_intermediate_mask.detach()
-        ffn_output_mask = masked_model.ffn_output_mask.detach()
-    else:
-        # No masks - use None for evaluation
-        head_mask = None
-        ffn_intermediate_mask = None
-        ffn_output_mask = None
-
-    # Print the pruning time
-    end = time.time()
-
     logger.info(f"{args.task_name} Training time (s): {end - start}")
-
-    # Evaluate the accuracy
-    test_acc = test_accuracy(model, head_mask, ffn_intermediate_mask, ffn_output_mask, tokenizer, args.task_name)
-    logger.info(f"{args.task_name} Test accuracy: {test_acc:.4f}")
     
     if args.wandb:
         wandb.finish()

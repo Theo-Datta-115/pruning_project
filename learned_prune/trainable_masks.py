@@ -66,8 +66,14 @@ def _wrap_self_attention(attention_module: nn.Module, mask_param: nn.Parameter, 
         past_key_value=None,
         output_attentions=False,
     ):
-        mask = mask_param[layer_idx].to(hidden_states.device, hidden_states.dtype).view(1, -1, 1, 1)
-        effective_mask = mask if head_mask is None else head_mask * torch.sigmoid(mask) #torch.sigmoid(mask)
+        # During training, apply sigmoid to get continuous masks
+        # During eval, use the provided head_mask directly (which should be binary)
+        if self.training:
+            mask = mask_param[layer_idx].to(hidden_states.device, hidden_states.dtype).view(1, -1, 1, 1)
+            effective_mask = torch.sigmoid(mask) if head_mask is None else head_mask * torch.sigmoid(mask)
+        else:
+            effective_mask = head_mask
+        
         return original_forward(
             hidden_states,
             attention_mask,
@@ -90,8 +96,11 @@ def _wrap_ffn_intermediate(intermediate_module: nn.Module, mask_param: nn.Parame
     original_forward = intermediate_module.forward
 
     def forward(self, hidden_states):
-        mask = mask_param[layer_idx].to(hidden_states.device, hidden_states.dtype).view(1, 1, -1)
-        hidden_states = hidden_states * torch.sigmoid(mask) #torch.sigmoid(mask)
+        # During training, apply sigmoid to get continuous masks
+        # During eval, masks are applied via hooks (not here)
+        if self.training:
+            mask = mask_param[layer_idx].to(hidden_states.device, hidden_states.dtype).view(1, 1, -1)
+            hidden_states = hidden_states * torch.sigmoid(mask)
         return original_forward(hidden_states)
 
     intermediate_module.forward = forward.__get__(intermediate_module, intermediate_module.__class__)
@@ -106,8 +115,11 @@ def _wrap_ffn_output(output_module: nn.Module, mask_param: nn.Parameter, layer_i
     original_forward = output_module.forward
 
     def forward(self, hidden_states, input_tensor):
-        mask = mask_param[layer_idx].to(hidden_states.device, hidden_states.dtype).view(1, 1, -1)
-        hidden_states = hidden_states * torch.sigmoid(mask) #torch.sigmoid(mask)
+        # During training, apply sigmoid to get continuous masks
+        # During eval, masks are applied via hooks (not here)
+        if self.training:
+            mask = mask_param[layer_idx].to(hidden_states.device, hidden_states.dtype).view(1, 1, -1)
+            hidden_states = hidden_states * torch.sigmoid(mask)
         return original_forward(hidden_states, input_tensor)
 
     output_module.forward = forward.__get__(output_module, output_module.__class__)
