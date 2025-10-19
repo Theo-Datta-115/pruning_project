@@ -92,6 +92,37 @@ parser.add_argument('--quantization_loss', type=float, default=0.01, help='Quant
 parser.add_argument('--sparsity_loss', type=float, default=0.1, help='Sparsity loss weight')
 parser.add_argument('--hard_init', action='store_true', help='Hard Initialization of the Masks')
 parser.add_argument('--masks_LR', type=float, default=1e-2, help='Learning rate for masks')
+parser.add_argument('--learn_masks', type=str, default='ffn_int', 
+                    choices=['head', 'ffn_int', 'ffn_out', 'all'],
+                    help='Which masks to learn: head, ffn_int, ffn_out, or all')
+
+def compute_mask_losses(model, learn_head, learn_ffn_int, learn_ffn_out):
+    """Compute sparsity and quantization losses for active masks."""
+    sparsity_loss = 0.0
+    quantization_loss = 0.0
+    num_active = 0
+    
+    for mask_name, mask_tensor, is_active in [
+        ('head', model.trainable_head_mask, learn_head),
+        ('ffn_int', model.trainable_ffn_intermediate_mask, learn_ffn_int),
+        ('ffn_out', model.trainable_ffn_output_mask, learn_ffn_out),
+    ]:
+        if is_active:
+            mask_sigmoid = torch.sigmoid(mask_tensor)
+            sparsity_loss += torch.mean(mask_sigmoid)
+            
+            mask_clamped = torch.clamp(mask_sigmoid, 1e-7, 1 - 1e-7)
+            quantization_loss += torch.mean(
+                -torch.log(mask_clamped) * mask_clamped - 
+                torch.log(1 - mask_clamped) * (1 - mask_clamped)
+            )
+            num_active += 1
+    
+    if num_active > 0:
+        sparsity_loss /= num_active
+        quantization_loss /= num_active
+    
+    return sparsity_loss, quantization_loss
 
 def main():
     args = parser.parse_args()
@@ -186,16 +217,22 @@ def main():
     model = model.cuda()
 
     if args.prune:
+        # Determine which masks to learn
+        learn_head = args.learn_masks in ['head', 'all']
+        learn_ffn_int = args.learn_masks in ['ffn_int', 'all']
+        learn_ffn_out = args.learn_masks in ['ffn_out', 'all']
+        
         logger.info("Pruning enabled - using trainable masks")
-        # more or less only plays with intermediate layers
-        if args.hard_init:
-            full_head_mask = torch.ones(config.num_hidden_layers, config.num_attention_heads).cuda() * 10
-            full_ffn_intermediate_mask = torch.ones(config.num_hidden_layers, config.hidden_size).cuda() * 10
-            full_ffn_output_mask = torch.ones(config.num_hidden_layers, config.intermediate_size).cuda() * 10
-        else:
-            full_head_mask = torch.randn(config.num_hidden_layers, config.num_attention_heads).cuda()
-            full_ffn_intermediate_mask = torch.randn(config.num_hidden_layers, config.hidden_size).cuda()
-            full_ffn_output_mask = torch.randn(config.num_hidden_layers, config.intermediate_size).cuda()
+        # Initialize masks: learned ones get random/hard init, fixed ones get 10 (sigmoid≈1)
+        def init_mask(shape, learn):
+            if learn:
+                return torch.randn(*shape).cuda() if not args.hard_init else torch.ones(*shape).cuda() * 10
+            else:
+                return torch.ones(*shape).cuda() * 10
+        
+        full_head_mask = init_mask((config.num_hidden_layers, config.num_attention_heads), learn_head)
+        full_ffn_intermediate_mask = init_mask((config.num_hidden_layers, config.hidden_size), learn_ffn_int)
+        full_ffn_output_mask = init_mask((config.num_hidden_layers, config.intermediate_size), learn_ffn_out)
 
         masked_model = make_masks_trainable(
             model,
@@ -204,26 +241,20 @@ def main():
             ffn_output_mask=full_ffn_output_mask,
         )
 
-        # Freeze the masks after they've been converted to parameters
-        if args.freeze:
-            if masked_model.head_mask is not None:
-                masked_model.head_mask.requires_grad = False
-            if masked_model.ffn_intermediate_mask is not None:
-                masked_model.ffn_intermediate_mask.requires_grad = False
-            if masked_model.ffn_output_mask is not None:
-                masked_model.ffn_output_mask.requires_grad = False
+        # Set requires_grad based on which masks we're learning
+        masked_model.head_mask.requires_grad = learn_head and not args.freeze
+        masked_model.ffn_intermediate_mask.requires_grad = learn_ffn_int and not args.freeze
+        masked_model.ffn_output_mask.requires_grad = learn_ffn_out and not args.freeze
 
-        # Collect mask parameters (even though they're frozen, we need to exclude them from base_params)
+        # Collect trainable mask parameters
         mask_params = [
-            param
-            for param in (
-                masked_model.head_mask,
-                masked_model.ffn_intermediate_mask,
-                masked_model.ffn_output_mask,
-            )
-            if param is not None
+            p for p in [masked_model.head_mask, masked_model.ffn_intermediate_mask, masked_model.ffn_output_mask]
+            if p.requires_grad
         ]
-        mask_param_ids = {id(param) for param in mask_params}
+        
+        # All mask parameters (for exclusion from base_params)
+        all_mask_params = [masked_model.head_mask, masked_model.ffn_intermediate_mask, masked_model.ffn_output_mask]
+        mask_param_ids = {id(p) for p in all_mask_params}
         
         # Base params are everything except the masks
         base_params = [param for param in model.parameters() if id(param) not in mask_param_ids]
@@ -274,13 +305,7 @@ def main():
             outputs = model(**batch)
             
             if args.prune:
-                masks = model.trainable_ffn_intermediate_mask #sigmoid
-                sparsity_loss = torch.mean(torch.sigmoid(masks))# + torch.mean(model.trainable_ffn_output_mask) + torch.mean(model.trainable_head_mask)
-                
-                # Information-based quantization loss with epsilon for numerical stability
-                masks_clamped = torch.clamp(masks, 1e-7, 1 - 1e-7) # clamp to avoid log(0)
-                quantization_loss = torch.mean(-torch.log(masks_clamped) * masks_clamped - torch.log(1 - masks_clamped) * (1 - masks_clamped))
-                # quantization_loss = (4 * masks * (1 - masks)).mean()
+                sparsity_loss, quantization_loss = compute_mask_losses(model, learn_head, learn_ffn_int, learn_ffn_out)
             else:
                 sparsity_loss = torch.tensor(0.0)
                 quantization_loss = torch.tensor(0.0)
@@ -296,31 +321,30 @@ def main():
 
             if args.log_loss_every > 0 and global_step % args.log_loss_every == 0:
                 if args.prune:
-                    masks_sigmoid = torch.sigmoid(masks)
-                    pct_below_half = (masks_sigmoid < 0.5).float().mean().item() * 100
-                    pct_below_005 = (masks_sigmoid < 0.05).float().mean().item() * 100
-                    pct_above_095 = (masks_sigmoid > 0.95).float().mean().item() * 100
-                    
-                    logger.info(f"Step {global_step}: training loss {outputs.loss.item():.4f}, sparsity loss {sparsity_loss.item():.4f}")
-                    logger.info(f"Mask stats - min: {masks_sigmoid.min().item():.4f}, max: {masks_sigmoid.max().item():.4f}, mean: {masks_sigmoid.mean().item():.4f}")
-                    logger.info(f"Mask percentages - <0.5: {pct_below_half:.2f}%, <0.05: {pct_below_005:.2f}%, >0.95: {pct_above_095:.2f}%")
+                    logger.info(f"Step {global_step}: loss {outputs.loss.item():.4f}, sparsity {sparsity_loss.item():.4f}, quant {quantization_loss.item():.4f}")
                     
                     if args.wandb:
-                        wandb.log({
+                        log_dict = {
                             "train/loss": outputs.loss.item(),
                             "train/sparsity_loss": sparsity_loss.item(),
                             "train/quantization_loss": quantization_loss.item(),
                             "train/total_loss": loss.item(),
-                            "masks/min": masks_sigmoid.min().item(),
-                            "masks/max": masks_sigmoid.max().item(),
-                            "masks/mean": masks_sigmoid.mean().item(),
-                            "masks/std": masks_sigmoid.std().item(),
-                            "masks/pct_below_0.5": pct_below_half,
-                            "masks/pct_below_0.05": pct_below_005,
-                            "masks/pct_above_0.95": pct_above_095,
                             "global_step": global_step,
                             "epoch": epoch,
-                        })
+                        }
+                        
+                        for mask_name, mask_tensor, is_active in [
+                            ('head', model.trainable_head_mask, learn_head),
+                            ('ffn_int', model.trainable_ffn_intermediate_mask, learn_ffn_int),
+                            ('ffn_out', model.trainable_ffn_output_mask, learn_ffn_out),
+                        ]:
+                            if is_active:
+                                m_sig = torch.sigmoid(mask_tensor)
+                                log_dict[f"masks/{mask_name}_mean"] = m_sig.mean().item()
+                                log_dict[f"masks/{mask_name}_pct_below_0.5"] = 100 * (m_sig < 0.5).float().mean().item()
+                                log_dict[f"masks/{mask_name}_pct_above_0.95"] = 100 * (m_sig > 0.95).float().mean().item()
+                        
+                        wandb.log(log_dict)
                 else:
                     logger.info(f"Step {global_step}: training loss {outputs.loss.item():.4f}")
                     
