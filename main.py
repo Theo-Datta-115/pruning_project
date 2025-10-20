@@ -32,6 +32,7 @@ from transformers import (
     AutoModelForQuestionAnswering,
     AutoTokenizer,
     DataCollatorWithPadding,
+    get_linear_schedule_with_warmup,
     set_seed,
 )
 
@@ -113,8 +114,8 @@ def compute_mask_losses(model, learn_head, learn_ffn_int, learn_ffn_out, tempera
         ('ffn_out', model.trainable_ffn_output_mask, learn_ffn_out),
     ]:
         if is_active:
-            # Use Gumbel-sigmoid for loss computation during training
-            mask_sigmoid = gumbel_sigmoid(mask_tensor, temperature=temperature, training=model.training)
+            # Use temperature-scaled sigmoid (no Gumbel noise) for loss computation
+            mask_sigmoid = torch.sigmoid(mask_tensor / temperature)
             sparsity_loss += torch.mean(mask_sigmoid)
             
             mask_clamped = torch.clamp(mask_sigmoid, 1e-7, 1 - 1e-7)
@@ -284,6 +285,16 @@ def main():
             {"params": mask_params, "lr": args.masks_LR, "weight_decay": 0.0},
         ]
     )
+    
+    # Learning rate scheduler with warmup
+    num_training_steps = args.num_epochs * len(masked_train_dataloader)
+    num_warmup_steps = int(0.1 * num_training_steps)  # 10% warmup
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=num_training_steps
+    )
+    
     model.train()
     global_step = 0
 
@@ -331,6 +342,7 @@ def main():
             loss.backward()
             
             optimizer.step()
+            scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
             epoch_loss += loss.item()
@@ -347,6 +359,7 @@ def main():
                             "train/quantization_loss": quantization_loss.item(),
                             "train/total_loss": loss.item(),
                             "train/gumbel_temperature": current_temp,
+                            "train/learning_rate": scheduler.get_last_lr()[0],
                             "global_step": global_step,
                             "epoch": epoch,
                         }
