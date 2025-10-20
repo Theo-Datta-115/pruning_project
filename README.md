@@ -1,82 +1,96 @@
-# A Fast Post-Training Pruning Framework for Transformers
+# Transformer Pruning with Trainable Masks
 
-Inspired by post-training quantization (PTQ) toolkits, we propose a post-training pruning framework tailored for Transformers.
-Different from existing pruning methods, our framework does not require re-training to retain high accuracy after pruning.
-This makes our method fully automated and 10x-1000x faster in terms of pruning time.
-[[paper link](https://arxiv.org/abs/2204.09656)]
+Train neural network pruning masks using Gumbel-Sigmoid relaxation. This framework learns which attention heads and FFN neurons to prune during training, using differentiable masks with temperature annealing.
 
-<div align="center">
-  <img src=figures/overview.png>
-</div>
+## Quick Start
 
-## Prerequisite
-
-### Install denpendencies
-
-Tested on Python 3.7.10.
-You need an NVIDIA GPU (with 16+ GB memory) to run our code.
+### Install Dependencies
 
 ```bash
 pip3 install -r requirements.txt
 ```
 
-### Prepare checkpoints
+Requires Python 3.7+ and an NVIDIA GPU with 16+ GB memory.
 
-You can populate the local `checkpoints/` directory automatically using the
-helper script:
+### Download Checkpoints
+
+Use the helper script to download pre-trained models:
 
 ```bash
-python scripts/download_checkpoints.py --tasks qqp --models bert-base-uncased distilbert-base-uncased
+python scripts/download_checkpoints.py --tasks qqp --models bert-base-uncased
 ```
 
-By default this will create directories such as
-`checkpoints/bert-base-uncased/qqp/` that contain the Hugging Face
-`config.json`, `pytorch_model.bin`, and tokenizer files required by
-`main.py`. Use `--help` to see additional options (custom output directories,
-overwriting, specific tasks, Hugging Face tokens, etc.).
+This creates `checkpoints/bert-base-uncased/qqp/` with the model files needed by `main.py`.
 
-If you prefer to download checkpoints manually, the fine-tuned models used in
-our experiments remain available here:
+## Training with Learnable Masks
 
-| Model | Link |
-|:-----:|:-----:|
-| BERT-base | [gdrive](https://drive.google.com/drive/folders/1OWHL7Cjhaf2n67PZX4Pt0Be3Gv2VCLo0?usp=sharing) |
-| DistilBERT | [gdrive](https://drive.google.com/drive/folders/1ZyGQL5ynoXs0ffGkENNjHq7eijB-B80l?usp=sharing) |
+`main.py` trains a model with learnable pruning masks using Gumbel-Sigmoid:
 
-Our framework only accepts Hugging Face Transformers PyTorch models.
-If you use your own checkpoints, please make sure that each checkpoint
-directory contains at minimum `config.json` and `pytorch_model.bin`.
-
-## Prune models and test the accuracy on GLUE/SQuAD benchmarks
-
-* Supported models: BERT-base/large, DistilBERT, RoBERTa-base/large, DistilRoBERTa, etc.
-* Supported tasks:
-  * GLUE: MNLI, QQP, QNLI, SST-2, STS-B, MRPC
-  * SQuAD V1.1 & V2
-
-The following example prunes a QQP BERT-base model with 50% MAC (FLOPs) constraint:
 ```bash
-python3 main.py --model_name bert-base-uncased \
-                --task_name qqp \
-                --ckpt_dir <your HF ckpt directory> \
-                --constraint 0.5
+python main.py --model_name bert-base-uncased \
+               --task_name qqp \
+               --prune \
+               --learn_masks ffn_int \
+               --num_epochs 5 \
+               --wandb
 ```
 
-You can also control more arguments such as sample dataset size (see `main.py`).
+### Key Arguments
 
-## Citation
+**Required:**
+- `--model_name`: Model architecture (e.g., `bert-base-uncased`)
+- `--task_name`: Task to train on (`qqp`, `mnli`, `qnli`, `sst2`, `mrpc`, `stsb`, `squad`, `squad_v2`)
+- `--prune`: Enable trainable mask learning
 
-```bibtex
-@misc{kwon2022fast,
-      title={A Fast Post-Training Pruning Framework for Transformers}, 
-      author={Woosuk Kwon and Sehoon Kim and Michael W. Mahoney and Joseph Hassoun and Kurt Keutzer and Amir Gholami},
-      year={2022},
-      eprint={2204.09656},
-      archivePrefix={arXiv},
-      primaryClass={cs.CL}
-}
-```
+**Mask Selection:**
+- `--learn_masks`: Which masks to learn (`head`, `ffn_int`, `ffn_out`, `all`)
 
-## Copyright
+**Gumbel-Sigmoid Temperature:**
+- `--gumbel_temp_start`: Starting temperature (default: 5.0, higher = more exploration)
+- `--gumbel_temp_end`: Ending temperature (default: 0.1, lower = more discrete)
+- `--gumbel_temp_anneal`: Schedule (`linear`, `exponential`, `constant`)
 
-THIS SOFTWARE AND/OR DATA WAS DEPOSITED IN THE BAIR OPEN RESEARCH COMMONS REPOSITORY ON 02/07/23.
+**Loss Weights:**
+- `--sparsity_loss`: Weight for sparsity regularization (default: 0.1)
+- `--quantization_loss`: Weight for binary quantization (default: 0.01)
+
+**Training:**
+- `--num_epochs`: Number of training epochs (default: 5)
+- `--masks_LR`: Learning rate for masks (default: 0.01)
+- `--freeze`: Freeze model weights, only train masks
+
+**Logging:**
+- `--wandb`: Enable Weights & Biases logging
+- `--name`: Run name for wandb
+- `--log_loss_every`: Log frequency in steps (default: 5)
+
+### Output
+
+Trained masks are saved to `--output_dir` as:
+- `head_mask.pt`
+- `ffn_intermediate_mask.pt`
+- `ffn_output_mask.pt`
+
+## What to Change for Your Setup
+
+1. **Checkpoint directory**: Update `--output_dir` in `main.py` (line 76) or pass via command line
+2. **Default checkpoint root**: Change `default_root` in `scripts/download_checkpoints.py` (line 78)
+3. **Downloading Models**: Use `scripts/download_checkpoints.py` to download models from Hugging Face Hub
+4. **Changing Wandb Logging**: Use `--wandb` to enable Weights & Biases logging, and change target directory in `main.py` (line 76)
+
+## How It Works
+
+Trains models with learnable pruning masks:
+- Wraps model with trainable mask parameters
+- Applies Gumbel-Sigmoid during forward pass for differentiable sampling
+- Anneals temperature from high (exploration) to low (discrete decisions)
+- Computes sparsity (mean) and quantization (binary cross-entropy) losses to encourage binary masks
+- Saves final binary masks after training
+
+## Supported Models & Tasks
+
+**Models:** BERT-base/large, DistilBERT, RoBERTa-base/large, etc.
+
+**Tasks:**
+- GLUE: MNLI, QQP, QNLI, SST-2, STS-B, MRPC
+- SQuAD V1.1 & V2

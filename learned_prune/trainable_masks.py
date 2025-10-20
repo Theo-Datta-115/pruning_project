@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 
 from utils.arch import get_layers, get_ffn1, get_ffn2
+from utils.schedule import gumbel_sigmoid
 
 
 @dataclass
@@ -49,7 +50,7 @@ def _ensure_parameter(module: nn.Module, name: str, value: torch.Tensor) -> nn.P
     return param
 
 
-def _wrap_self_attention(attention_module: nn.Module, mask_param: nn.Parameter, layer_idx: int) -> None:
+def _wrap_self_attention(attention_module: nn.Module, mask_param: nn.Parameter, layer_idx: int, model: nn.Module) -> None:
     """Inject trainable head masks into ``BertSelfAttention`` forward pass."""
     if getattr(attention_module, "_trainable_mask_wrapped", False):
         return
@@ -66,11 +67,13 @@ def _wrap_self_attention(attention_module: nn.Module, mask_param: nn.Parameter, 
         past_key_value=None,
         output_attentions=False,
     ):
-        # During training, apply sigmoid to get continuous masks
+        # During training, apply Gumbel-sigmoid to get continuous masks
         # During eval, use the provided head_mask directly (which should be binary)
         if self.training:
             mask = mask_param[layer_idx].to(hidden_states.device, hidden_states.dtype).view(1, -1, 1, 1)
-            effective_mask = torch.sigmoid(mask) if head_mask is None else head_mask * torch.sigmoid(mask)
+            temperature = getattr(model, 'gumbel_temperature', 1.0)
+            mask_probs = gumbel_sigmoid(mask, temperature=temperature, training=True)
+            effective_mask = mask_probs if head_mask is None else head_mask * mask_probs
         else:
             effective_mask = head_mask
         
@@ -88,7 +91,7 @@ def _wrap_self_attention(attention_module: nn.Module, mask_param: nn.Parameter, 
     attention_module._trainable_mask_wrapped = True
 
 
-def _wrap_ffn_intermediate(intermediate_module: nn.Module, mask_param: nn.Parameter, layer_idx: int) -> None:
+def _wrap_ffn_intermediate(intermediate_module: nn.Module, mask_param: nn.Parameter, layer_idx: int, model: nn.Module) -> None:
     """Multiply intermediate activations by a trainable mask before passing downstream."""
     if getattr(intermediate_module, "_trainable_mask_wrapped", False):
         return
@@ -96,18 +99,19 @@ def _wrap_ffn_intermediate(intermediate_module: nn.Module, mask_param: nn.Parame
     original_forward = intermediate_module.forward
 
     def forward(self, hidden_states):
-        # During training, apply sigmoid to get continuous masks
+        # During training, apply Gumbel-sigmoid to get continuous masks
         # During eval, masks are applied via hooks (not here)
         if self.training:
             mask = mask_param[layer_idx].to(hidden_states.device, hidden_states.dtype).view(1, 1, -1)
-            hidden_states = hidden_states * torch.sigmoid(mask)
+            temperature = getattr(model, 'gumbel_temperature', 1.0)
+            hidden_states = hidden_states * gumbel_sigmoid(mask, temperature=temperature, training=True)
         return original_forward(hidden_states)
 
     intermediate_module.forward = forward.__get__(intermediate_module, intermediate_module.__class__)
     intermediate_module._trainable_mask_wrapped = True
 
 
-def _wrap_ffn_output(output_module: nn.Module, mask_param: nn.Parameter, layer_idx: int) -> None:
+def _wrap_ffn_output(output_module: nn.Module, mask_param: nn.Parameter, layer_idx: int, model: nn.Module) -> None:
     """Apply a trainable mask to the pre-projection FFN activations."""
     if getattr(output_module, "_trainable_mask_wrapped", False):
         return
@@ -115,11 +119,12 @@ def _wrap_ffn_output(output_module: nn.Module, mask_param: nn.Parameter, layer_i
     original_forward = output_module.forward
 
     def forward(self, hidden_states, input_tensor):
-        # During training, apply sigmoid to get continuous masks
+        # During training, apply Gumbel-sigmoid to get continuous masks
         # During eval, masks are applied via hooks (not here)
         if self.training:
             mask = mask_param[layer_idx].to(hidden_states.device, hidden_states.dtype).view(1, 1, -1)
-            hidden_states = hidden_states * torch.sigmoid(mask)
+            temperature = getattr(model, 'gumbel_temperature', 1.0)
+            hidden_states = hidden_states * gumbel_sigmoid(mask, temperature=temperature, training=True)
         return original_forward(hidden_states, input_tensor)
 
     output_module.forward = forward.__get__(output_module, output_module.__class__)
@@ -162,10 +167,14 @@ def make_masks_trainable(
     ffn_intermediate_param: Optional[nn.Parameter] = None
     ffn_output_param: Optional[nn.Parameter] = None
 
+    # Initialize Gumbel temperature on the model
+    if not hasattr(model, 'gumbel_temperature'):
+        model.gumbel_temperature = 1.0
+
     if head_mask is not None:
         head_param = _ensure_parameter(model, "trainable_head_mask", head_mask.to(device=device, dtype=dtype))
         for idx, layer in enumerate(get_layers(model)):
-            _wrap_self_attention(layer.attention.self, head_param, idx)
+            _wrap_self_attention(layer.attention.self, head_param, idx, model)
 
     if ffn_intermediate_mask is not None:
         ffn_intermediate_param = _ensure_parameter(
@@ -175,7 +184,7 @@ def make_masks_trainable(
         )
         for idx in range(ffn_intermediate_param.shape[0]):
             intermediate_module = get_ffn1(model, idx)
-            _wrap_ffn_intermediate(intermediate_module, ffn_intermediate_param, idx)
+            _wrap_ffn_intermediate(intermediate_module, ffn_intermediate_param, idx, model)
 
     if ffn_output_mask is not None:
         ffn_output_param = _ensure_parameter(
@@ -185,7 +194,7 @@ def make_masks_trainable(
         )
         for idx in range(ffn_output_param.shape[0]):
             output_module = get_ffn2(model, idx)
-            _wrap_ffn_output(output_module, ffn_output_param, idx)
+            _wrap_ffn_output(output_module, ffn_output_param, idx, model)
 
     return TrainableMaskHandles(
         head_mask=head_param,

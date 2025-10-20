@@ -44,7 +44,7 @@ from prune.search import search_mac, search_latency
 from prune.rearrange import rearrange_mask
 from prune.rescale import rescale_mask
 from evaluate.nlp import test_accuracy
-from utils.schedule import get_pruning_schedule
+from utils.schedule import get_pruning_schedule, gumbel_sigmoid, get_gumbel_temperature
 from learned_prune.trainable_masks import make_masks_trainable
 from utils.model_loader import load_model_and_tokenizer
 
@@ -82,7 +82,7 @@ parser.add_argument(
     action="store_true",
     help="Load the base pretrained weights for `--model_name` instead of a fine-tuned checkpoint.",
 )
-parser.add_argument("--num_epochs", type=int, default=15)
+parser.add_argument("--num_epochs", type=int, default=5)
 parser.add_argument('--log_loss_every', type=int, default=5)
 parser.add_argument('--prune', action='store_true', help='Enable pruning with trainable masks')
 parser.add_argument('--wandb', action='store_true', help='W&B project name (enables W&B logging if provided)')
@@ -95,8 +95,13 @@ parser.add_argument('--masks_LR', type=float, default=1e-2, help='Learning rate 
 parser.add_argument('--learn_masks', type=str, default='ffn_int', 
                     choices=['head', 'ffn_int', 'ffn_out', 'all'],
                     help='Which masks to learn: head, ffn_int, ffn_out, or all')
+parser.add_argument('--gumbel_temp_start', type=float, default=5.0, help='Starting Gumbel temperature')
+parser.add_argument('--gumbel_temp_end', type=float, default=0.1, help='Ending Gumbel temperature')
+parser.add_argument('--gumbel_temp_anneal', type=str, default='linear', 
+                    choices=['linear', 'exponential', 'constant'],
+                    help='Temperature annealing schedule')
 
-def compute_mask_losses(model, learn_head, learn_ffn_int, learn_ffn_out):
+def compute_mask_losses(model, learn_head, learn_ffn_int, learn_ffn_out, temperature):
     """Compute sparsity and quantization losses for active masks."""
     sparsity_loss = 0.0
     quantization_loss = 0.0
@@ -108,7 +113,8 @@ def compute_mask_losses(model, learn_head, learn_ffn_int, learn_ffn_out):
         ('ffn_out', model.trainable_ffn_output_mask, learn_ffn_out),
     ]:
         if is_active:
-            mask_sigmoid = torch.sigmoid(mask_tensor)
+            # Use Gumbel-sigmoid for loss computation during training
+            mask_sigmoid = gumbel_sigmoid(mask_tensor, temperature=temperature, training=model.training)
             sparsity_loss += torch.mean(mask_sigmoid)
             
             mask_clamped = torch.clamp(mask_sigmoid, 1e-7, 1 - 1e-7)
@@ -295,6 +301,9 @@ def main():
             logger.info(f"Tracking param: {name}, initial mean: {param.data.mean().item():.6f}, std: {param.data.std().item():.6f}")
             break
 
+    # Calculate total training steps for temperature annealing
+    total_steps = args.num_epochs * len(masked_train_dataloader)
+
     for epoch in range(args.num_epochs):
         model.train()
         epoch_loss = 0.0
@@ -302,10 +311,18 @@ def main():
             for key, value in batch.items():
                 batch[key] = value.to("cuda", non_blocking=True)
 
+            # Update Gumbel temperature
+            if args.prune:
+                current_temp = get_gumbel_temperature(
+                    global_step, total_steps, args.gumbel_temp_start, 
+                    args.gumbel_temp_end, args.gumbel_temp_anneal
+                )
+                model.gumbel_temperature = current_temp
+            
             outputs = model(**batch)
             
             if args.prune:
-                sparsity_loss, quantization_loss = compute_mask_losses(model, learn_head, learn_ffn_int, learn_ffn_out)
+                sparsity_loss, quantization_loss = compute_mask_losses(model, learn_head, learn_ffn_int, learn_ffn_out, current_temp)
             else:
                 sparsity_loss = torch.tensor(0.0)
                 quantization_loss = torch.tensor(0.0)
@@ -321,7 +338,7 @@ def main():
 
             if args.log_loss_every > 0 and global_step % args.log_loss_every == 0:
                 if args.prune:
-                    logger.info(f"Step {global_step}: loss {outputs.loss.item():.4f}, sparsity {sparsity_loss.item():.4f}, quant {quantization_loss.item():.4f}")
+                    logger.info(f"Step {global_step}: loss {outputs.loss.item():.4f}, sparsity {sparsity_loss.item():.4f}, quant {quantization_loss.item():.4f}, temp {current_temp:.4f}")
                     
                     if args.wandb:
                         log_dict = {
@@ -329,6 +346,7 @@ def main():
                             "train/sparsity_loss": sparsity_loss.item(),
                             "train/quantization_loss": quantization_loss.item(),
                             "train/total_loss": loss.item(),
+                            "train/gumbel_temperature": current_temp,
                             "global_step": global_step,
                             "epoch": epoch,
                         }
