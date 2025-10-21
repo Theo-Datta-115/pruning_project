@@ -101,6 +101,11 @@ parser.add_argument('--gumbel_temp_end', type=float, default=1.0, help='Ending G
 parser.add_argument('--gumbel_temp_anneal', type=str, default='linear', 
                     choices=['linear', 'exponential', 'constant'],
                     help='Temperature annealing schedule')
+parser.add_argument('--layerwise_train', action='store_true', 
+                    help='Train each BERT layer sequentially instead of all at once')
+parser.add_argument('--layerwise_order', type=str, default='front_to_back',
+                    choices=['front_to_back', 'back_to_front', 'random'],
+                    help='Order for layer-wise training')
 
 def compute_mask_losses(model, learn_head, learn_ffn_int, learn_ffn_out, temperature):
     """Compute sparsity and quantization losses for active masks."""
@@ -129,6 +134,113 @@ def compute_mask_losses(model, learn_head, learn_ffn_int, learn_ffn_out, tempera
         quantization_loss /= num_active
     
     return sparsity_loss, quantization_loss
+
+def training_step(batch, model, optimizer, args, global_step, total_steps, learn_head, learn_ffn_int, learn_ffn_out, layer_idx=None):
+    """Execute a single training step. Returns (loss, outputs, sparsity_loss, quantization_loss, current_temp)."""
+    for key, value in batch.items():
+        batch[key] = value.to("cuda", non_blocking=True)
+
+    # Update Gumbel temperature
+    if args.prune:
+        current_temp = get_gumbel_temperature(
+            global_step, total_steps, args.gumbel_temp_start, 
+            args.gumbel_temp_end, args.gumbel_temp_anneal
+        )
+        model.gumbel_temperature = current_temp
+    else:
+        current_temp = None
+    
+    outputs = model(**batch)
+    
+    if args.prune:
+        sparsity_loss, quantization_loss = compute_mask_losses(
+            model, learn_head, learn_ffn_int, learn_ffn_out, current_temp
+        )
+    else:
+        sparsity_loss = torch.tensor(0.0)
+        quantization_loss = torch.tensor(0.0)
+
+    loss = outputs.loss + sparsity_loss * args.sparsity_loss + quantization_loss * args.quantization_loss
+    loss.backward()
+    
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    
+    return loss, outputs, sparsity_loss, quantization_loss, current_temp
+
+def log_training_step(logger, wandb, args, global_step, outputs, loss, sparsity_loss, quantization_loss, current_temp, model, learn_head, learn_ffn_int, learn_ffn_out, epoch=None, layer_idx=None):
+    """Log training metrics."""
+    if args.prune:
+        log_msg = f"Step {global_step}: loss {outputs.loss.item():.4f}, sparsity {sparsity_loss.item():.4f}, quant {quantization_loss.item():.4f}, temp {current_temp:.4f}"
+        if layer_idx is not None:
+            log_msg = f"Layer {layer_idx}, " + log_msg
+        logger.info(log_msg)
+        
+        if args.wandb:
+            log_dict = {
+                "train/loss": outputs.loss.item(),
+                "train/sparsity_loss": sparsity_loss.item(),
+                "train/quantization_loss": quantization_loss.item(),
+                "train/total_loss": loss.item(),
+                "train/gumbel_temperature": current_temp,
+                "global_step": global_step,
+            }
+            if epoch is not None:
+                log_dict["epoch"] = epoch
+            if layer_idx is not None:
+                log_dict["current_layer"] = layer_idx
+            
+            # Log mask statistics
+            for mask_name, mask_tensor, is_active in [
+                ('head', model.trainable_head_mask, learn_head),
+                ('ffn_int', model.trainable_ffn_intermediate_mask, learn_ffn_int),
+                ('ffn_out', model.trainable_ffn_output_mask, learn_ffn_out),
+            ]:
+                if is_active:
+                    if layer_idx is not None:
+                        # For layerwise, log specific layer
+                        m_sig = torch.sigmoid(mask_tensor[layer_idx])
+                        log_dict[f"masks/layer_{layer_idx}_{mask_name}_mean"] = m_sig.mean().item()
+                        log_dict[f"masks/layer_{layer_idx}_{mask_name}_pct_below_0.5"] = 100 * (m_sig < 0.5).float().mean().item()
+                    else:
+                        # For standard, log all layers
+                        m_sig = torch.sigmoid(mask_tensor)
+                        log_dict[f"masks/{mask_name}_mean"] = m_sig.mean().item()
+                        log_dict[f"masks/{mask_name}_pct_below_0.5"] = 100 * (m_sig < 0.5).float().mean().item()
+                        log_dict[f"masks/{mask_name}_pct_above_0.95"] = 100 * (m_sig > 0.95).float().mean().item()
+            
+            wandb.log(log_dict)
+    else:
+        logger.info(f"Step {global_step}: training loss {outputs.loss.item():.4f}")
+        
+        if args.wandb:
+            log_dict = {
+                "train/loss": outputs.loss.item(),
+                "global_step": global_step,
+            }
+            if epoch is not None:
+                log_dict["epoch"] = epoch
+            wandb.log(log_dict)
+
+def init_layer_masks(masked_model, config, layer_idx, learn_head, learn_ffn_int, learn_ffn_out, hard_init):
+    """Initialize masks for a specific layer."""
+    if learn_head:
+        if hard_init:
+            masked_model.head_mask.data[layer_idx] = torch.ones(config.num_attention_heads).cuda() * 10
+        else:
+            masked_model.head_mask.data[layer_idx] = torch.randn(config.num_attention_heads).cuda()
+    
+    if learn_ffn_int:
+        if hard_init:
+            masked_model.ffn_intermediate_mask.data[layer_idx] = torch.ones(config.hidden_size).cuda() * 10
+        else:
+            masked_model.ffn_intermediate_mask.data[layer_idx] = torch.randn(config.hidden_size).cuda()
+    
+    if learn_ffn_out:
+        if hard_init:
+            masked_model.ffn_output_mask.data[layer_idx] = torch.ones(config.intermediate_size).cuda() * 10
+        else:
+            masked_model.ffn_output_mask.data[layer_idx] = torch.randn(config.intermediate_size).cuda()
 
 def main():
     args = parser.parse_args()
@@ -221,6 +333,21 @@ def main():
 
     # Prepare the model
     model = model.cuda()
+    
+    # Determine layer training order if layerwise training is enabled
+    num_layers = config.num_hidden_layers
+    if args.layerwise_train:
+        if args.layerwise_order == 'front_to_back':
+            layer_order = list(range(num_layers))
+        elif args.layerwise_order == 'back_to_front':
+            layer_order = list(range(num_layers - 1, -1, -1))
+        elif args.layerwise_order == 'random':
+            layer_order = list(range(num_layers))
+            np.random.shuffle(layer_order)
+        logger.info(f"Layer-wise training enabled with order: {args.layerwise_order}")
+        logger.info(f"Training order: {layer_order}")
+    else:
+        layer_order = None
 
     if args.prune:
         # Determine which masks to learn
@@ -229,10 +356,13 @@ def main():
         learn_ffn_out = args.learn_masks in ['ffn_out', 'all']
         
         logger.info("Pruning enabled - using trainable masks")
+        # For layerwise training, initialize as if hard_init is True (all masks start at ~1)
+        effective_hard_init = args.hard_init or args.layerwise_train
+        
         # Initialize masks: learned ones get random/hard init, fixed ones get 10 (sigmoid≈1)
         def init_mask(shape, learn):
             if learn:
-                return torch.randn(*shape).cuda() if not args.hard_init else torch.ones(*shape).cuda() * 10
+                return torch.randn(*shape).cuda() if not effective_hard_init else torch.ones(*shape).cuda() * 10
             else:
                 return torch.ones(*shape).cuda() * 10
         
@@ -313,83 +443,53 @@ def main():
 
     # Calculate total training steps for temperature annealing
     total_steps = args.num_epochs * len(masked_train_dataloader)
+    
+    # Start timing
+    start = time.time()
 
-    for epoch in range(args.num_epochs):
-        model.train()
-        epoch_loss = 0.0
-        for batch in masked_train_dataloader:
-            for key, value in batch.items():
-                batch[key] = value.to("cuda", non_blocking=True)
-
-            # Update Gumbel temperature
-            if args.prune:
-                current_temp = get_gumbel_temperature(
-                    global_step, total_steps, args.gumbel_temp_start, 
-                    args.gumbel_temp_end, args.gumbel_temp_anneal
-                )
-                model.gumbel_temperature = current_temp
-            
-            outputs = model(**batch)
-            
-            if args.prune:
-                sparsity_loss, quantization_loss = compute_mask_losses(model, learn_head, learn_ffn_int, learn_ffn_out, current_temp)
-            else:
-                sparsity_loss = torch.tensor(0.0)
-                quantization_loss = torch.tensor(0.0)
-
-            loss = outputs.loss + sparsity_loss * args.sparsity_loss + quantization_loss * args.quantization_loss
-            loss.backward()
-            
-            optimizer.step()
-            # scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
-
-            epoch_loss += loss.item()
-            global_step += 1
-
-            if args.log_loss_every > 0 and global_step % args.log_loss_every == 0:
-                if args.prune:
-                    logger.info(f"Step {global_step}: loss {outputs.loss.item():.4f}, sparsity {sparsity_loss.item():.4f}, quant {quantization_loss.item():.4f}, temp {current_temp:.4f}")
-                    
-                    if args.wandb:
-                        log_dict = {
-                            "train/loss": outputs.loss.item(),
-                            "train/sparsity_loss": sparsity_loss.item(),
-                            "train/quantization_loss": quantization_loss.item(),
-                            "train/total_loss": loss.item(),
-                            "train/gumbel_temperature": current_temp,
-                            # "train/learning_rate": scheduler.get_last_lr()[0],
-                            "global_step": global_step,
-                            "epoch": epoch,
-                        }
-                        
-                        for mask_name, mask_tensor, is_active in [
-                            ('head', model.trainable_head_mask, learn_head),
-                            ('ffn_int', model.trainable_ffn_intermediate_mask, learn_ffn_int),
-                            ('ffn_out', model.trainable_ffn_output_mask, learn_ffn_out),
-                        ]:
-                            if is_active:
-                                m_sig = torch.sigmoid(mask_tensor)
-                                log_dict[f"masks/{mask_name}_mean"] = m_sig.mean().item()
-                                log_dict[f"masks/{mask_name}_pct_below_0.5"] = 100 * (m_sig < 0.5).float().mean().item()
-                                log_dict[f"masks/{mask_name}_pct_above_0.95"] = 100 * (m_sig > 0.95).float().mean().item()
-                        
-                        wandb.log(log_dict)
-                else:
-                    logger.info(f"Step {global_step}: training loss {outputs.loss.item():.4f}")
-                    
-                    if args.wandb:
-                        wandb.log({
-                            "train/loss": outputs.loss.item(),
-                            "global_step": global_step,
-                            "epoch": epoch,
-                        })
-
-        # Evaluate at the end of each epoch
-        model.eval()
+    # Layer-wise training loop
+    if args.layerwise_train and args.prune:
+        logger.info(f"Starting layer-wise training for {num_layers} layers")
+        # Calculate steps per layer: divide total epochs across all layers
+        steps_per_layer = (args.num_epochs * len(masked_train_dataloader)) // num_layers
+        batches_per_layer = steps_per_layer
+        logger.info(f"Total steps: {total_steps}, Steps per layer: {steps_per_layer}")
         
-        if args.prune:
-            # Convert continuous masks to binary: sigmoid(mask) >= 0.5 -> 1, else -> 0
+        # Create an iterator over the training data
+        train_iter = iter(masked_train_dataloader)
+        
+        for layer_idx_pos, layer_idx in enumerate(layer_order):
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Training layer {layer_idx} ({layer_idx_pos + 1}/{num_layers})")
+            logger.info(f"{'='*60}\n")
+            
+            # Reinitialize masks for this layer
+            init_layer_masks(masked_model, config, layer_idx, learn_head, learn_ffn_int, learn_ffn_out, args.hard_init)
+            
+            # Train this layer for its allocated steps
+            model.train()
+            for step_in_layer in range(batches_per_layer):
+                try:
+                    batch = next(train_iter)
+                except StopIteration:
+                    # Reset iterator if we run out of data
+                    train_iter = iter(masked_train_dataloader)
+                    batch = next(train_iter)
+                
+                loss, outputs, sparsity_loss, quantization_loss, current_temp = training_step(
+                    batch, model, optimizer, args, global_step, total_steps, 
+                    learn_head, learn_ffn_int, learn_ffn_out, layer_idx=layer_idx
+                )
+                global_step += 1
+
+                if args.log_loss_every > 0 and global_step % args.log_loss_every == 0:
+                    log_training_step(logger, wandb, args, global_step, outputs, loss, sparsity_loss, 
+                                    quantization_loss, current_temp, model, learn_head, learn_ffn_int, 
+                                    learn_ffn_out, epoch=None, layer_idx=layer_idx)
+            
+            # Evaluate after training this layer
+            model.eval()
+            
             head_mask_sigmoid = torch.sigmoid(masked_model.head_mask.detach())
             head_mask = (head_mask_sigmoid >= 0.5).float()
             
@@ -398,21 +498,63 @@ def main():
             
             ffn_output_mask_sigmoid = torch.sigmoid(masked_model.ffn_output_mask.detach())
             ffn_output_mask = (ffn_output_mask_sigmoid >= 0.5).float()
-        else:
-            head_mask = None
-            ffn_intermediate_mask = None
-            ffn_output_mask = None
-        
-        epoch_test_acc = test_accuracy(model, head_mask, ffn_intermediate_mask, ffn_output_mask, tokenizer, args.task_name)
-        logger.info(f"Epoch {epoch + 1}/{args.num_epochs} - Test accuracy: {epoch_test_acc:.4f}")
-        
-        if args.wandb:
-            wandb.log({
-                "eval/accuracy": epoch_test_acc,
-                "epoch": epoch,
-                "global_step": global_step,
-            })
+            
+            epoch_test_acc = test_accuracy(model, head_mask, ffn_intermediate_mask, ffn_output_mask, tokenizer, args.task_name)
+            logger.info(f"Layer {layer_idx} complete - Test accuracy: {epoch_test_acc:.4f}")
+            
+            if args.wandb:
+                wandb.log({
+                    "eval/accuracy": epoch_test_acc,
+                    "global_step": global_step,
+                    "current_layer": layer_idx,
+                })
+    else:
+        # Standard training (all layers at once)
+        for epoch in range(args.num_epochs):
+            model.train()
+            epoch_loss = 0.0
+            for batch in masked_train_dataloader:
+                loss, outputs, sparsity_loss, quantization_loss, current_temp = training_step(
+                    batch, model, optimizer, args, global_step, total_steps, 
+                    learn_head, learn_ffn_int, learn_ffn_out, layer_idx=None
+                )
+                epoch_loss += loss.item()
+                global_step += 1
 
+                if args.log_loss_every > 0 and global_step % args.log_loss_every == 0:
+                    log_training_step(logger, wandb, args, global_step, outputs, loss, sparsity_loss, 
+                                    quantization_loss, current_temp, model, learn_head, learn_ffn_int, 
+                                    learn_ffn_out, epoch=epoch, layer_idx=None)
+
+            # Evaluate at the end of each epoch
+            model.eval()
+            
+            if args.prune:
+                # Convert continuous masks to binary: sigmoid(mask) >= 0.5 -> 1, else -> 0
+                head_mask_sigmoid = torch.sigmoid(masked_model.head_mask.detach())
+                head_mask = (head_mask_sigmoid >= 0.5).float()
+                
+                ffn_intermediate_mask_sigmoid = torch.sigmoid(masked_model.ffn_intermediate_mask.detach())
+                ffn_intermediate_mask = (ffn_intermediate_mask_sigmoid >= 0.5).float()
+                
+                ffn_output_mask_sigmoid = torch.sigmoid(masked_model.ffn_output_mask.detach())
+                ffn_output_mask = (ffn_output_mask_sigmoid >= 0.5).float()
+            else:
+                head_mask = None
+                ffn_intermediate_mask = None
+                ffn_output_mask = None
+            
+            epoch_test_acc = test_accuracy(model, head_mask, ffn_intermediate_mask, ffn_output_mask, tokenizer, args.task_name)
+            logger.info(f"Epoch {epoch + 1}/{args.num_epochs} - Test accuracy: {epoch_test_acc:.4f}")
+            
+            if args.wandb:
+                wandb.log({
+                    "eval/accuracy": epoch_test_acc,
+                    "epoch": epoch,
+                    "global_step": global_step,
+                })
+    
+    end = time.time()
     logger.info(f"{args.task_name} Training time (s): {end - start}")
     
     if args.wandb:
