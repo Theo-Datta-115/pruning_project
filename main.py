@@ -101,6 +101,8 @@ parser.add_argument('--gumbel_temp_end', type=float, default=1.0, help='Ending G
 parser.add_argument('--gumbel_temp_anneal', type=str, default='linear', 
                     choices=['linear', 'exponential', 'constant'],
                     help='Temperature annealing schedule')
+parser.add_argument('--frozen_epochs', type=int, default=0, 
+                    help='Number of epochs to train with frozen masks at the end (only applies if --prune is enabled)')
 
 def compute_mask_losses(model, learn_head, learn_ffn_int, learn_ffn_out, temperature):
     """Compute sparsity and quantization losses for active masks."""
@@ -114,7 +116,7 @@ def compute_mask_losses(model, learn_head, learn_ffn_int, learn_ffn_out, tempera
         ('ffn_out', model.trainable_ffn_output_mask, learn_ffn_out),
     ]:
         if is_active:
-            mask_sigmoid = torch.sigmoid(mask_tensor)
+            mask_sigmoid = torch.sigmoid(mask_tensor) # no temperature built in
             sparsity_loss += torch.mean(mask_sigmoid)
             
             mask_clamped = torch.clamp(mask_sigmoid, 1e-7, 1 - 1e-7)
@@ -312,15 +314,30 @@ def main():
             break
 
     # Calculate total training steps for temperature annealing
+    # Add frozen epochs if pruning is enabled
+    num_training_epochs = args.num_epochs + args.frozen_epochs if args.prune else args.num_epochs
     total_steps = args.num_epochs * len(masked_train_dataloader)
 
-    for epoch in range(args.num_epochs):
+    for epoch in range(num_training_epochs):
+        # Freeze masks during the frozen epochs at the end if pruning is enabled
+        is_frozen_epoch = args.prune and (epoch >= args.num_epochs)
+        if is_frozen_epoch and epoch == args.num_epochs:
+            # First frozen epoch - freeze masks and recreate optimizer
+            logger.info(f"Epoch {epoch + 1}/{num_training_epochs} - Starting frozen mask epochs ({args.frozen_epochs} total)")
+            masked_model.head_mask.requires_grad = False
+            masked_model.ffn_intermediate_mask.requires_grad = False
+            masked_model.ffn_output_mask.requires_grad = False
+            
+            # Recreate optimizer with only base params
+            optimizer = torch.optim.AdamW(
+                [{"params": base_params, "lr": 5e-5, "weight_decay": 0.01}]
+            )
+        
         model.train()
         epoch_loss = 0.0
         for batch in masked_train_dataloader:
             for key, value in batch.items():
                 batch[key] = value.to("cuda", non_blocking=True)
-
             # Update Gumbel temperature
             if args.prune:
                 current_temp = get_gumbel_temperature(
@@ -404,7 +421,7 @@ def main():
             ffn_output_mask = None
         
         epoch_test_acc = test_accuracy(model, head_mask, ffn_intermediate_mask, ffn_output_mask, tokenizer, args.task_name)
-        logger.info(f"Epoch {epoch + 1}/{args.num_epochs} - Test accuracy: {epoch_test_acc:.4f}")
+        logger.info(f"Epoch {epoch + 1}/{num_training_epochs} - Test accuracy: {epoch_test_acc:.4f}")
         
         if args.wandb:
             wandb.log({

@@ -22,7 +22,7 @@ def gumbel_sigmoid(logits: torch.Tensor, temperature: float = 1.0, training: boo
         # Sample Gumbel noise: g = -log(-log(u)) where u ~ Uniform(0,1)
         u = torch.rand_like(logits)
         gumbel_noise = -torch.log(-torch.log(u + 1e-20) + 1e-20)
-        return torch.sigmoid((logits + gumbel_noise) / temperature)
+        return torch.sigmoid((logits / temperature) + gumbel_noise)
     else:
         # During eval, just apply temperature-scaled sigmoid without noise
         return torch.sigmoid(logits / temperature)
