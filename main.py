@@ -99,10 +99,50 @@ parser.add_argument('--learn_masks', type=str, default='ffn_int',
 parser.add_argument('--gumbel_temp_start', type=float, default=5.0, help='Starting Gumbel temperature')
 parser.add_argument('--gumbel_temp_end', type=float, default=1.0, help='Ending Gumbel temperature')
 parser.add_argument('--gumbel_temp_anneal', type=str, default='linear', 
-                    choices=['linear', 'exponential', 'constant'],
-                    help='Temperature annealing schedule')
+                    choices=['linear', 'exponential', 'constant', 'none'],
+                    help='Temperature annealing schedule (use "none" to disable Gumbel and use normal sigmoid)')
 parser.add_argument('--frozen_epochs', type=int, default=0, 
                     help='Number of epochs to train with frozen masks at the end (only applies if --prune is enabled)')
+parser.add_argument('--masks_reinit', action='store_true', 
+                    help='Reinitialize a random percentage of low-value masks every 500 steps')
+parser.add_argument('--masks_reinit_percent', type=float, default=0.2, 
+                    help='Percentage of low-value masks to reinitialize (default 0.1 = 10%%)')
+
+def reinitialize_low_masks(model, learn_head, learn_ffn_int, learn_ffn_out, reinit_percent=0.1, threshold=0.5):
+    """Reinitialize a random percentage of mask values below threshold.
+    
+    Args:
+        model: Model with trainable masks
+        learn_head: Whether head masks are being learned
+        learn_ffn_int: Whether FFN intermediate masks are being learned
+        learn_ffn_out: Whether FFN output masks are being learned
+        reinit_percent: Percentage of low-value masks to reinitialize (default 0.1 = 10%)
+        threshold: Sigmoid threshold below which masks are candidates for reinitialization (default 0.5)
+    """
+    with torch.no_grad():
+        for mask_name, mask_tensor, is_active in [
+            ('head', model.trainable_head_mask, learn_head),
+            ('ffn_int', model.trainable_ffn_intermediate_mask, learn_ffn_int),
+            ('ffn_out', model.trainable_ffn_output_mask, learn_ffn_out),
+        ]:
+            if is_active:
+                mask_sigmoid = torch.sigmoid(mask_tensor)
+                # Find indices where sigmoid(mask) < threshold
+                low_mask_indices = (mask_sigmoid < threshold).nonzero(as_tuple=True)
+                num_low = len(low_mask_indices[0])
+                
+                if num_low > 0:
+                    # Randomly select reinit_percent of the low-value masks
+                    num_to_reinit = max(1, int(num_low * reinit_percent))
+                    perm = torch.randperm(num_low)[:num_to_reinit]
+                    
+                    # Get the actual indices to reinitialize
+                    reinit_indices = tuple(idx[perm] for idx in low_mask_indices)
+                    
+                    # Reinitialize with random normal values
+                    mask_tensor[reinit_indices] = torch.randn(num_to_reinit, device=mask_tensor.device)
+                    
+                    logger.info(f"Reinitialized {num_to_reinit}/{num_low} low-value {mask_name} masks")
 
 def compute_mask_losses(model, learn_head, learn_ffn_int, learn_ffn_out, temperature):
     """Compute sparsity and quantization losses for active masks."""
@@ -248,6 +288,9 @@ def main():
             ffn_intermediate_mask=full_ffn_intermediate_mask,
             ffn_output_mask=full_ffn_output_mask,
         )
+        
+        # Initialize Gumbel settings
+        model.use_gumbel = (args.gumbel_temp_anneal != 'none')
 
         # Set requires_grad based on which masks we're learning
         masked_model.head_mask.requires_grad = learn_head and not args.freeze
@@ -345,6 +388,7 @@ def main():
                     args.gumbel_temp_end, args.gumbel_temp_anneal
                 )
                 model.gumbel_temperature = current_temp
+                model.use_gumbel = (args.gumbel_temp_anneal != 'none')
             
             outputs = model(**batch)
             
@@ -363,6 +407,10 @@ def main():
 
             epoch_loss += loss.item()
             global_step += 1
+            
+            # Reinitialize low-value masks every 500 steps if enabled
+            if args.prune and args.masks_reinit and global_step % 500 == 0 and epoch < args.num_epochs - 1:
+                reinitialize_low_masks(model, learn_head, learn_ffn_int, learn_ffn_out, reinit_percent=args.masks_reinit_percent)
 
             if args.log_loss_every > 0 and global_step % args.log_loss_every == 0:
                 if args.prune:

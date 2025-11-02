@@ -8,24 +8,24 @@ def get_pruning_schedule(target, num_iter):
     return schedule
 
 
-def gumbel_sigmoid(logits: torch.Tensor, temperature: float = 1.0, training: bool = True) -> torch.Tensor:
+def gumbel_sigmoid(logits: torch.Tensor, temperature: float = 1.0, training: bool = True, use_gumbel: bool = True) -> torch.Tensor:
     """Apply Gumbel-Sigmoid: sigmoid((logits + gumbel_noise) / temperature).
 
     Args:
         logits: Input logits to apply Gumbel-Sigmoid to.
         temperature: Temperature parameter. Lower values make the output more discrete.
-        training: If True, adds Gumbel noise. If False, just applies temperature-scaled sigmoid.
+        use_gumbel: If False, disables Gumbel noise and uses normal sigmoid.
     Returns:
         The Gumbel-Sigmoid output.
     """
-    if training:
+    if use_gumbel and training:
         # Sample Gumbel noise: g = -log(-log(u)) where u ~ Uniform(0,1)
         u = torch.rand_like(logits)
         gumbel_noise = -torch.log(-torch.log(u + 1e-20) + 1e-20)
-        return torch.sigmoid((logits / temperature) + gumbel_noise)
+        return torch.sigmoid(logits + (gumbel_noise * temperature))
     else:
         # During eval, just apply temperature-scaled sigmoid without noise
-        return torch.sigmoid(logits / temperature)
+        return torch.sigmoid(logits)
 
 
 def get_gumbel_temperature(step: int, total_steps: int, temp_start: float, temp_end: float, anneal_type: str = 'linear') -> float:

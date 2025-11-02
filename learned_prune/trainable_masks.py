@@ -72,7 +72,8 @@ def _wrap_self_attention(attention_module: nn.Module, mask_param: nn.Parameter, 
         if self.training:
             mask = mask_param[layer_idx].to(hidden_states.device, hidden_states.dtype).view(1, -1, 1, 1)
             temperature = getattr(model, 'gumbel_temperature', 1.0)
-            mask_probs = gumbel_sigmoid(mask, temperature=temperature, training=True)
+            use_gumbel = getattr(model, 'use_gumbel', True)
+            mask_probs = gumbel_sigmoid(mask, temperature=temperature, training=True, use_gumbel=use_gumbel)
             effective_mask = mask_probs if head_mask is None else head_mask * mask_probs
         else:
             effective_mask = head_mask
@@ -104,7 +105,8 @@ def _wrap_ffn_intermediate(intermediate_module: nn.Module, mask_param: nn.Parame
         if self.training:
             mask = mask_param[layer_idx].to(hidden_states.device, hidden_states.dtype).view(1, 1, -1)
             temperature = getattr(model, 'gumbel_temperature', 1.0)
-            hidden_states = hidden_states * gumbel_sigmoid(mask, temperature=temperature, training=True)
+            use_gumbel = getattr(model, 'use_gumbel', True)
+            hidden_states = hidden_states * gumbel_sigmoid(mask, temperature=temperature, training=True, use_gumbel=use_gumbel)
         return original_forward(hidden_states)
 
     intermediate_module.forward = forward.__get__(intermediate_module, intermediate_module.__class__)
@@ -124,7 +126,8 @@ def _wrap_ffn_output(output_module: nn.Module, mask_param: nn.Parameter, layer_i
         if self.training:
             mask = mask_param[layer_idx].to(hidden_states.device, hidden_states.dtype).view(1, 1, -1)
             temperature = getattr(model, 'gumbel_temperature', 1.0)
-            hidden_states = hidden_states * gumbel_sigmoid(mask, temperature=temperature, training=True)
+            use_gumbel = getattr(model, 'use_gumbel', True)
+            hidden_states = hidden_states * gumbel_sigmoid(mask, temperature=temperature, training=True, use_gumbel=use_gumbel)
         return original_forward(hidden_states, input_tensor)
 
     output_module.forward = forward.__get__(output_module, output_module.__class__)
@@ -167,9 +170,11 @@ def make_masks_trainable(
     ffn_intermediate_param: Optional[nn.Parameter] = None
     ffn_output_param: Optional[nn.Parameter] = None
 
-    # Initialize Gumbel temperature on the model
+    # Initialize Gumbel temperature and use_gumbel flag on the model
     if not hasattr(model, 'gumbel_temperature'):
         model.gumbel_temperature = 1.0
+    if not hasattr(model, 'use_gumbel'):
+        model.use_gumbel = True
 
     if head_mask is not None:
         head_param = _ensure_parameter(model, "trainable_head_mask", head_mask.to(device=device, dtype=dtype))
