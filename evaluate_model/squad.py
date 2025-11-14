@@ -1,5 +1,5 @@
 import torch
-from datasets import load_metric
+from evaluate import load as load_metric
 
 from dataset.squad import create_and_fill_np_array, post_processing_function
 from utils.arch import apply_neuron_mask

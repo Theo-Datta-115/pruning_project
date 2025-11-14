@@ -44,7 +44,7 @@ from prune.fisher import collect_mask_grads
 from prune.search import search_mac, search_latency
 from prune.rearrange import rearrange_mask
 from prune.rescale import rescale_mask
-from evaluate.nlp import test_accuracy
+from evaluate_model.nlp import test_accuracy
 from utils.schedule import get_pruning_schedule, gumbel_sigmoid, get_gumbel_temperature
 from learned_prune.trainable_masks import make_masks_trainable
 from utils.model_loader import load_model_and_tokenizer
@@ -98,7 +98,7 @@ parser.add_argument('--learn_masks', type=str, default='ffn_int',
                     help='Which masks to learn: head, ffn_int, ffn_out, or all')
 parser.add_argument('--gumbel_temp_start', type=float, default=5.0, help='Starting Gumbel temperature')
 parser.add_argument('--gumbel_temp_end', type=float, default=1.0, help='Ending Gumbel temperature')
-parser.add_argument('--gumbel_temp_anneal', type=str, default='linear', 
+parser.add_argument('--gumbel_temp_anneal', type=str, default='none', 
                     choices=['linear', 'exponential', 'constant', 'none'],
                     help='Temperature annealing schedule (use "none" to disable Gumbel and use normal sigmoid)')
 parser.add_argument('--frozen_epochs', type=int, default=0, 
@@ -107,6 +107,7 @@ parser.add_argument('--masks_reinit', action='store_true',
                     help='Reinitialize a random percentage of low-value masks every 500 steps')
 parser.add_argument('--masks_reinit_percent', type=float, default=0.2, 
                     help='Percentage of low-value masks to reinitialize (default 0.1 = 10%%)')
+parser.add_argument('--train_sequential', type=str, default='none', choices=['front_to_back', 'back_to_front', 'random', 'none'])
 
 def reinitialize_low_masks(model, learn_head, learn_ffn_int, learn_ffn_out, reinit_percent=0.1, threshold=0.5):
     """Reinitialize a random percentage of mask values below threshold.
@@ -293,9 +294,10 @@ def main():
         model.use_gumbel = (args.gumbel_temp_anneal != 'none')
 
         # Set requires_grad based on which masks we're learning
-        masked_model.head_mask.requires_grad = learn_head and not args.freeze
-        masked_model.ffn_intermediate_mask.requires_grad = learn_ffn_int and not args.freeze
-        masked_model.ffn_output_mask.requires_grad = learn_ffn_out and not args.freeze
+        freeze = args.freeze or args.train_sequential != 'none'
+        masked_model.head_mask.requires_grad = learn_head and not freeze
+        masked_model.ffn_intermediate_mask.requires_grad = learn_ffn_int and not freeze
+        masked_model.ffn_output_mask.requires_grad = learn_ffn_out and not freeze
 
         # Collect trainable mask parameters
         mask_params = [
@@ -342,23 +344,41 @@ def main():
     model.train()
     global_step = 0
 
-    if args.prune:
-        m = model.trainable_ffn_intermediate_mask
-        print("requires_grad:", m.requires_grad)
-        ids = {id(p) for g in optimizer.param_groups for p in g['params']}
-        print("in optimizer:", id(m) in ids)
+    # if args.prune:
+    #     m = model.trainable_ffn_intermediate_mask
+    #     print("requires_grad:", m.requires_grad)
+    #     ids = {id(p) for g in optimizer.param_groups for p in g['params']}
+    #     print("in optimizer:", id(m) in ids)
     
-    # Track a base model parameter to verify it's learning
-    sample_param = None
-    for name, param in model.named_parameters():
-        if 'trainable' not in name and 'weight' in name and param.requires_grad:
-            sample_param = (name, param.clone().detach())
-            logger.info(f"Tracking param: {name}, initial mean: {param.data.mean().item():.6f}, std: {param.data.std().item():.6f}")
-            break
+    # # Track a base model parameter to verify it's learning
+    # sample_param = None
+    # for name, param in model.named_parameters():
+    #     if 'trainable' not in name and 'weight' in name and param.requires_grad:
+    #         sample_param = (name, param.clone().detach())
+    #         logger.info(f"Tracking param: {name}, initial mean: {param.data.mean().item():.6f}, std: {param.data.std().item():.6f}")
+    #         break
 
+    # Determine layer training order if layerwise training is enabled
+    num_layers = config.num_hidden_layers
+    if args.train_sequential != 'none':
+        if args.train_sequential == 'front_to_back':
+            layer_order = list(range(num_layers))
+        elif args.train_sequential == 'back_to_front':
+            layer_order = list(range(num_layers - 1, -1, -1))
+        elif args.train_sequential == 'random':
+            layer_order = list(range(num_layers))
+            np.random.shuffle(layer_order)
+        logger.info(f"Layer-wise training enabled with order: {args.train_sequential}")
+        logger.info(f"Training order: {layer_order}")
+    else:
+        layer_order = None
+        
     # Calculate total training steps for temperature annealing
     # Add frozen epochs if pruning is enabled
-    num_training_epochs = args.num_epochs + args.frozen_epochs if args.prune else args.num_epochs
+    if args.train_sequential != 'none':
+        num_training_epochs = num_layers + args.frozen_epochs
+    else:
+        num_training_epochs = args.num_epochs + args.frozen_epochs if args.prune else args.num_epochs
     total_steps = args.num_epochs * len(masked_train_dataloader)
 
     for epoch in range(num_training_epochs):
@@ -376,11 +396,17 @@ def main():
                 [{"params": base_params, "lr": 5e-5, "weight_decay": 0.01}]
             )
         
+        if args.train_sequential != 'none' and not is_frozen_epoch:
+            masked_model.head_mask[layer_order[epoch]].requires_grad = learn_head and not args.freeze
+            masked_model.ffn_intermediate_mask[layer_order[epoch]].requires_grad = learn_ffn_int and not args.freeze
+            masked_model.ffn_output_mask[layer_order[epoch]].requires_grad = learn_ffn_out and not args.freeze
+            
         model.train()
         epoch_loss = 0.0
         for batch in masked_train_dataloader:
             for key, value in batch.items():
                 batch[key] = value.to("cuda", non_blocking=True)
+
             # Update Gumbel temperature
             if args.prune:
                 current_temp = get_gumbel_temperature(
@@ -414,7 +440,7 @@ def main():
 
             if args.log_loss_every > 0 and global_step % args.log_loss_every == 0:
                 if args.prune:
-                    logger.info(f"Step {global_step}: loss {outputs.loss.item():.4f}, sparsity {sparsity_loss.item():.4f}, quant {quantization_loss.item():.4f}, temp {current_temp:.4f}")
+                    logger.info(f"Step {global_step}: loss {outputs.loss.item():.4f}, sparsity {sparsity_loss.item():.4f}, quant {quantization_loss.item():.4f}")
                     
                     if args.wandb:
                         log_dict = {
@@ -438,6 +464,15 @@ def main():
                                 log_dict[f"masks/{mask_name}_mean"] = m_sig.mean().item()
                                 log_dict[f"masks/{mask_name}_pct_below_0.5"] = 100 * (m_sig < 0.5).float().mean().item()
                                 log_dict[f"masks/{mask_name}_pct_above_0.95"] = 100 * (m_sig > 0.95).float().mean().item()
+                                log_dict[f"masks/{mask_name}_pct_below_0.90"] = 100 * (m_sig < 0.05).float().mean().item()
+
+                                if args.train_sequential != 'none' and not is_frozen_epoch:
+                                    for idx in len(num_layers):
+                                        log_dict["currently unfreezing"] = layer_order[idx]
+                                        log_dict[f"masks_individual/{mask_name}_pct_below_0.5_{idx}"] = 100 * (m_sig[idx] < 0.5).float().mean().item()
+                                        log_dict[f"masks_individual/{mask_name}_pct_above_0.95_{idx}"] = 100 * (m_sig[idx] > 0.95).float().mean().item()
+                                        log_dict[f"masks_individual/{mask_name}_mean_{idx}"] = m_sig[idx].mean().item()
+                                        log_dict[f"masks_individual/{mask_name}_pct_below_0.05_{idx}"] = 100 * (m_sig[idx] < 0.05).float().mean().item()
                         
                         wandb.log(log_dict)
                 else:

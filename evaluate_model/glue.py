@@ -1,5 +1,5 @@
 import torch
-from datasets import load_metric
+from evaluate import load as load_metric
 from utils.arch import apply_neuron_mask
 from dataset.glue import target_dev_metric
 

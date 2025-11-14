@@ -57,36 +57,29 @@ def _wrap_self_attention(attention_module: nn.Module, mask_param: nn.Parameter, 
 
     original_forward = attention_module.forward
 
-    def forward(
-        self,
-        hidden_states,
-        attention_mask=None,
-        head_mask=None,
-        encoder_hidden_states=None,
-        encoder_attention_mask=None,
-        past_key_value=None,
-        output_attentions=False,
-    ):
-        # During training, apply Gumbel-sigmoid to get continuous masks
-        # During eval, use the provided head_mask directly (which should be binary)
+    def forward(self, *args, **kwargs):
+        # Get existing head_mask (if HF passed one)
+        incoming_head_mask = kwargs.get("head_mask", None)
+
+        # Build our (per-layer) mask
         if self.training:
-            mask = mask_param[layer_idx].to(hidden_states.device, hidden_states.dtype).view(1, -1, 1, 1)
-            temperature = getattr(model, 'gumbel_temperature', 1.0)
-            use_gumbel = getattr(model, 'use_gumbel', True)
-            mask_probs = gumbel_sigmoid(mask, temperature=temperature, training=True, use_gumbel=use_gumbel)
-            effective_mask = mask_probs if head_mask is None else head_mask * mask_probs
+            # shape: [1, num_heads, 1, 1]
+            base = mask_param[layer_idx].to(
+                kwargs.get("hidden_states", args[0]).device,  # infer device from hidden_states
+                kwargs.get("hidden_states", args[0]).dtype
+            ).view(1, -1, 1, 1)
+
+            temperature = getattr(model, "gumbel_temperature", 1.0)
+            use_gumbel  = getattr(model, "use_gumbel", True)
+            mask_probs  = gumbel_sigmoid(base, temperature=temperature, training=True, use_gumbel=use_gumbel)
+
+            effective_mask = mask_probs if incoming_head_mask is None else incoming_head_mask * mask_probs
         else:
-            effective_mask = head_mask
-        
-        return original_forward(
-            hidden_states,
-            attention_mask,
-            effective_mask,
-            encoder_hidden_states,
-            encoder_attention_mask,
-            past_key_value,
-            output_attentions,
-        )
+            effective_mask = incoming_head_mask  # at eval, use provided (typically binary) mask unchanged
+
+        # Inject back and pass everything through unchanged
+        kwargs["head_mask"] = effective_mask
+        return original_forward(*args, **kwargs)
 
     attention_module.forward = forward.__get__(attention_module, attention_module.__class__)
     attention_module._trainable_mask_wrapped = True
@@ -99,15 +92,13 @@ def _wrap_ffn_intermediate(intermediate_module: nn.Module, mask_param: nn.Parame
 
     original_forward = intermediate_module.forward
 
-    def forward(self, hidden_states):
-        # During training, apply Gumbel-sigmoid to get continuous masks
-        # During eval, masks are applied via hooks (not here)
+    def forward(self, hidden_states, *args, **kwargs):
         if self.training:
             mask = mask_param[layer_idx].to(hidden_states.device, hidden_states.dtype).view(1, 1, -1)
-            temperature = getattr(model, 'gumbel_temperature', 1.0)
-            use_gumbel = getattr(model, 'use_gumbel', True)
+            temperature = getattr(model, "gumbel_temperature", 1.0)
+            use_gumbel  = getattr(model, "use_gumbel", True)
             hidden_states = hidden_states * gumbel_sigmoid(mask, temperature=temperature, training=True, use_gumbel=use_gumbel)
-        return original_forward(hidden_states)
+        return original_forward(hidden_states, *args, **kwargs)
 
     intermediate_module.forward = forward.__get__(intermediate_module, intermediate_module.__class__)
     intermediate_module._trainable_mask_wrapped = True
@@ -120,19 +111,16 @@ def _wrap_ffn_output(output_module: nn.Module, mask_param: nn.Parameter, layer_i
 
     original_forward = output_module.forward
 
-    def forward(self, hidden_states, input_tensor):
-        # During training, apply Gumbel-sigmoid to get continuous masks
-        # During eval, masks are applied via hooks (not here)
+    def forward(self, hidden_states, *args, **kwargs):
         if self.training:
             mask = mask_param[layer_idx].to(hidden_states.device, hidden_states.dtype).view(1, 1, -1)
-            temperature = getattr(model, 'gumbel_temperature', 1.0)
-            use_gumbel = getattr(model, 'use_gumbel', True)
+            temperature = getattr(model, "gumbel_temperature", 1.0)
+            use_gumbel  = getattr(model, "use_gumbel", True)
             hidden_states = hidden_states * gumbel_sigmoid(mask, temperature=temperature, training=True, use_gumbel=use_gumbel)
-        return original_forward(hidden_states, input_tensor)
+        return original_forward(hidden_states, *args, **kwargs)
 
     output_module.forward = forward.__get__(output_module, output_module.__class__)
     output_module._trainable_mask_wrapped = True
-
 
 def make_masks_trainable(
     model: nn.Module,
