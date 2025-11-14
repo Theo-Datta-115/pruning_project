@@ -145,7 +145,7 @@ def reinitialize_low_masks(model, learn_head, learn_ffn_int, learn_ffn_out, rein
                     
                     logger.info(f"Reinitialized {num_to_reinit}/{num_low} low-value {mask_name} masks")
 
-def compute_mask_losses(model, learn_head, learn_ffn_int, learn_ffn_out, temperature):
+def compute_mask_losses(model, learn_head, learn_ffn_int, learn_ffn_out, temperature, layer_order, epoch, train_sequential):
     """Compute sparsity and quantization losses for active masks."""
     sparsity_loss = 0.0
     quantization_loss = 0.0
@@ -158,6 +158,10 @@ def compute_mask_losses(model, learn_head, learn_ffn_int, learn_ffn_out, tempera
     ]:
         if is_active:
             mask_sigmoid = torch.sigmoid(mask_tensor) # no temperature built in
+            
+            if train_sequential != 'none':
+                mask_sigmoid = mask_sigmoid[layer_order[:epoch + 1]]
+
             sparsity_loss += torch.mean(mask_sigmoid)
             
             mask_clamped = torch.clamp(mask_sigmoid, 1e-7, 1 - 1e-7)
@@ -181,6 +185,7 @@ def main():
 
     # Initialize wandb if enabled
     if args.wandb:
+        os.environ["WANDB_DIR"] = "/n/home03/tdatta/pruning_project/scripts/wandb_logs"
         import wandb
         wandb.init(
             entity="harvardml",
@@ -274,8 +279,8 @@ def main():
         logger.info("Pruning enabled - using trainable masks")
         # Initialize masks: learned ones get random/hard init, fixed ones get 10 (sigmoid≈1)
         def init_mask(shape, learn):
-            if learn:
-                return torch.randn(*shape).cuda() if not args.hard_init else torch.ones(*shape).cuda() * 10
+            if learn and (not args.hard_init) and (args.train_sequential == 'none'):
+                return torch.randn(*shape).cuda()
             else:
                 return torch.ones(*shape).cuda() * 10
         
@@ -294,10 +299,9 @@ def main():
         model.use_gumbel = (args.gumbel_temp_anneal != 'none')
 
         # Set requires_grad based on which masks we're learning
-        freeze = args.freeze or args.train_sequential != 'none'
-        masked_model.head_mask.requires_grad = learn_head and not freeze
-        masked_model.ffn_intermediate_mask.requires_grad = learn_ffn_int and not freeze
-        masked_model.ffn_output_mask.requires_grad = learn_ffn_out and not freeze
+        masked_model.head_mask.requires_grad = learn_head and not args.freeze
+        masked_model.ffn_intermediate_mask.requires_grad = learn_ffn_int and not args.freeze
+        masked_model.ffn_output_mask.requires_grad = learn_ffn_out and not args.freeze
 
         # Collect trainable mask parameters
         mask_params = [
@@ -397,9 +401,15 @@ def main():
             )
         
         if args.train_sequential != 'none' and not is_frozen_epoch:
-            masked_model.head_mask[layer_order[epoch]].requires_grad = learn_head and not args.freeze
-            masked_model.ffn_intermediate_mask[layer_order[epoch]].requires_grad = learn_ffn_int and not args.freeze
-            masked_model.ffn_output_mask[layer_order[epoch]].requires_grad = learn_ffn_out and not args.freeze
+            with torch.no_grad():
+                device = masked_model.head_mask.device
+                # Randomly Init the current layer for the unfreezing
+                if learn_head:
+                    masked_model.head_mask[layer_order[epoch]].copy_(torch.randn(config.num_attention_heads, device=device))
+                if learn_ffn_int:
+                    masked_model.ffn_intermediate_mask[layer_order[epoch]].copy_(torch.randn(config.hidden_size, device=device))
+                if learn_ffn_out:
+                    masked_model.ffn_output_mask[layer_order[epoch]].copy_(torch.randn(config.intermediate_size, device=device))
             
         model.train()
         epoch_loss = 0.0
@@ -419,7 +429,7 @@ def main():
             outputs = model(**batch)
             
             if args.prune:
-                sparsity_loss, quantization_loss = compute_mask_losses(model, learn_head, learn_ffn_int, learn_ffn_out, current_temp)
+                sparsity_loss, quantization_loss = compute_mask_losses(model, learn_head, learn_ffn_int, learn_ffn_out, current_temp, layer_order, epoch, args.train_sequential)
             else:
                 sparsity_loss = torch.tensor(0.0)
                 quantization_loss = torch.tensor(0.0)
@@ -467,8 +477,8 @@ def main():
                                 log_dict[f"masks/{mask_name}_pct_below_0.90"] = 100 * (m_sig < 0.05).float().mean().item()
 
                                 if args.train_sequential != 'none' and not is_frozen_epoch:
-                                    for idx in len(num_layers):
-                                        log_dict["currently unfreezing"] = layer_order[idx]
+                                    for idx in range(num_layers):
+                                        log_dict["masks_individual/currently unfreezing"] = layer_order[idx]
                                         log_dict[f"masks_individual/{mask_name}_pct_below_0.5_{idx}"] = 100 * (m_sig[idx] < 0.5).float().mean().item()
                                         log_dict[f"masks_individual/{mask_name}_pct_above_0.95_{idx}"] = 100 * (m_sig[idx] > 0.95).float().mean().item()
                                         log_dict[f"masks_individual/{mask_name}_mean_{idx}"] = m_sig[idx].mean().item()

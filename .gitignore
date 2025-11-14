@@ -7,3 +7,5 @@ hw2/
 logfiles/
 asynch.sh
 wandb/
+scripts/wandb_logs
+
