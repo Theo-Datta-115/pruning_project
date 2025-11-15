@@ -47,7 +47,7 @@ from prune.rescale import rescale_mask
 from evaluate_model.nlp import test_accuracy
 from utils.schedule import get_pruning_schedule, gumbel_sigmoid, get_gumbel_temperature
 from learned_prune.trainable_masks import make_masks_trainable
-from utils.model_loader import load_model_and_tokenizer
+from utils.model_loader import load_model_and_tokenizer, unfreeze_layer, unfreeze_model, freeze_model
 
 
 logger = logging.getLogger(__name__)
@@ -381,6 +381,7 @@ def main():
     # Add frozen epochs if pruning is enabled
     if args.train_sequential != 'none':
         num_training_epochs = num_layers + args.frozen_epochs
+        freeze_model(model, mask_param_ids)
     else:
         num_training_epochs = args.num_epochs + args.frozen_epochs if args.prune else args.num_epochs
     total_steps = args.num_epochs * len(masked_train_dataloader)
@@ -388,17 +389,6 @@ def main():
     for epoch in range(num_training_epochs):
         # Freeze masks during the frozen epochs at the end if pruning is enabled
         is_frozen_epoch = args.prune and (epoch >= args.num_epochs)
-        if is_frozen_epoch and epoch == args.num_epochs:
-            # First frozen epoch - freeze masks and recreate optimizer
-            logger.info(f"Epoch {epoch + 1}/{num_training_epochs} - Starting frozen mask epochs ({args.frozen_epochs} total)")
-            masked_model.head_mask.requires_grad = False
-            masked_model.ffn_intermediate_mask.requires_grad = False
-            masked_model.ffn_output_mask.requires_grad = False
-            
-            # Recreate optimizer with only base params
-            optimizer = torch.optim.AdamW(
-                [{"params": base_params, "lr": 5e-5, "weight_decay": 0.01}]
-            )
         
         if args.train_sequential != 'none' and not is_frozen_epoch:
             with torch.no_grad():
@@ -411,6 +401,12 @@ def main():
                 if learn_ffn_out:
                     masked_model.ffn_output_mask[layer_order[epoch]].copy_(torch.randn(config.intermediate_size, device=device))
             
+            # Unfreeze the layer we are training, and the classifier
+            unfreeze_layer(model, layer_order[epoch], unfreeze_head=True)
+
+        if args.train_sequential != 'none' and is_frozen_epoch:
+            unfreeze_model(model)
+
         model.train()
         epoch_loss = 0.0
         for batch in masked_train_dataloader:
@@ -428,7 +424,7 @@ def main():
             
             outputs = model(**batch)
             
-            if args.prune:
+            if args.prune and not is_frozen_epoch:
                 sparsity_loss, quantization_loss = compute_mask_losses(model, learn_head, learn_ffn_int, learn_ffn_out, current_temp, layer_order, epoch, args.train_sequential)
             else:
                 sparsity_loss = torch.tensor(0.0)
@@ -474,7 +470,7 @@ def main():
                                 log_dict[f"masks/{mask_name}_mean"] = m_sig.mean().item()
                                 log_dict[f"masks/{mask_name}_pct_below_0.5"] = 100 * (m_sig < 0.5).float().mean().item()
                                 log_dict[f"masks/{mask_name}_pct_above_0.95"] = 100 * (m_sig > 0.95).float().mean().item()
-                                log_dict[f"masks/{mask_name}_pct_below_0.90"] = 100 * (m_sig < 0.05).float().mean().item()
+                                log_dict[f"masks/{mask_name}_pct_below_0.05"] = 100 * (m_sig < 0.05).float().mean().item()
 
                                 if args.train_sequential != 'none' and not is_frozen_epoch:
                                     for idx in range(num_layers):

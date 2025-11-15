@@ -57,29 +57,36 @@ def _wrap_self_attention(attention_module: nn.Module, mask_param: nn.Parameter, 
 
     original_forward = attention_module.forward
 
-    def forward(self, *args, **kwargs):
-        # Get existing head_mask (if HF passed one)
-        incoming_head_mask = kwargs.get("head_mask", None)
-
-        # Build our (per-layer) mask
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        head_mask=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        past_key_value=None,
+        output_attentions=False,
+    ):
+        # During training, apply Gumbel-sigmoid to get continuous masks
+        # During eval, use the provided head_mask directly (which should be binary)
         if self.training:
-            # shape: [1, num_heads, 1, 1]
-            base = mask_param[layer_idx].to(
-                kwargs.get("hidden_states", args[0]).device,  # infer device from hidden_states
-                kwargs.get("hidden_states", args[0]).dtype
-            ).view(1, -1, 1, 1)
-
-            temperature = getattr(model, "gumbel_temperature", 1.0)
-            use_gumbel  = getattr(model, "use_gumbel", True)
-            mask_probs  = gumbel_sigmoid(base, temperature=temperature, training=True, use_gumbel=use_gumbel)
-
-            effective_mask = mask_probs if incoming_head_mask is None else incoming_head_mask * mask_probs
+            mask = mask_param[layer_idx].to(hidden_states.device, hidden_states.dtype).view(1, -1, 1, 1)
+            temperature = getattr(model, 'gumbel_temperature', 1.0)
+            use_gumbel = getattr(model, 'use_gumbel', True)
+            mask_probs = gumbel_sigmoid(mask, temperature=temperature, training=True, use_gumbel=use_gumbel)
+            effective_mask = mask_probs if head_mask is None else head_mask * mask_probs
         else:
-            effective_mask = incoming_head_mask  # at eval, use provided (typically binary) mask unchanged
-
-        # Inject back and pass everything through unchanged
-        kwargs["head_mask"] = effective_mask
-        return original_forward(*args, **kwargs)
+            effective_mask = head_mask
+        
+        return original_forward(
+            hidden_states,
+            attention_mask,
+            effective_mask,
+            encoder_hidden_states,
+            encoder_attention_mask,
+            past_key_value,
+            output_attentions,
+        )
 
     attention_module.forward = forward.__get__(attention_module, attention_module.__class__)
     attention_module._trainable_mask_wrapped = True

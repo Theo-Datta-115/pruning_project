@@ -84,3 +84,30 @@ def load_model_and_tokenizer(
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, use_auth_token=None)
 
     return config, model, tokenizer, model_source
+
+
+def freeze_model(model, mask_param_ids):
+    """Freeze all parameters in the model."""
+    for p in model.parameters():
+        if id(p) not in mask_param_ids:
+            p.requires_grad = False
+
+def unfreeze_layer(model, layer_idx, unfreeze_head=True):
+    """Unfreeze one encoder layer (and optionally the classifier head)."""
+
+    layer = model.bert.encoder.layer[layer_idx]
+    for p in layer.parameters():
+        p.requires_grad = True
+
+    if unfreeze_head and hasattr(model, "classifier"):
+        for p in model.classifier.parameters():
+            p.requires_grad = True
+
+    print(f"✅ Unfroze layer {layer_idx}" + (" and classifier head" if unfreeze_head else ""))
+
+
+def unfreeze_model(model):
+    """Unfreeze all parameters in the model."""
+    for p in model.parameters():
+        p.requires_grad = True
+    print("✅ Unfroze entire model")
