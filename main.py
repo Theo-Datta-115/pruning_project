@@ -26,6 +26,7 @@ import time
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
+from torch.optim.lr_scheduler import LambdaLR
 from transformers import (
     AutoConfig,
     AutoModelForSequenceClassification,
@@ -83,7 +84,7 @@ parser.add_argument(
     action="store_true",
     help="Load the base pretrained weights for `--model_name` instead of a fine-tuned checkpoint.",
 )
-parser.add_argument("--num_epochs", type=int, default=5)
+parser.add_argument("--num_epochs", type=int, default=12)
 parser.add_argument('--log_loss_every', type=int, default=5)
 parser.add_argument('--prune', action='store_true', help='Enable pruning with trainable masks')
 parser.add_argument('--wandb', action='store_true', help='W&B project name (enables W&B logging if provided)')
@@ -96,8 +97,8 @@ parser.add_argument('--masks_LR', type=float, default=1e-2, help='Learning rate 
 parser.add_argument('--learn_masks', type=str, default='ffn_int', 
                     choices=['head', 'ffn_int', 'ffn_out', 'all'],
                     help='Which masks to learn: head, ffn_int, ffn_out, or all')
-parser.add_argument('--gumbel_temp_start', type=float, default=5.0, help='Starting Gumbel temperature')
-parser.add_argument('--gumbel_temp_end', type=float, default=1.0, help='Ending Gumbel temperature')
+parser.add_argument('--gumbel_temp_start', type=float, default=1.0, help='Starting Gumbel temperature')
+parser.add_argument('--gumbel_temp_end', type=float, default=0.1, help='Ending Gumbel temperature')
 parser.add_argument('--gumbel_temp_anneal', type=str, default='none', 
                     choices=['linear', 'exponential', 'constant', 'none'],
                     help='Temperature annealing schedule (use "none" to disable Gumbel and use normal sigmoid)')
@@ -336,15 +337,6 @@ def main():
         ]
     )
     
-    # Learning rate scheduler with warmup
-    # num_training_steps = args.num_epochs * len(masked_train_dataloader)
-    # num_warmup_steps = int(0.1 * num_training_steps)  # 10% warmup
-    # scheduler = get_linear_schedule_with_warmup(
-    #     optimizer,
-    #     num_warmup_steps=num_warmup_steps,
-    #     num_training_steps=num_training_steps
-    # )
-    
     model.train()
     global_step = 0
 
@@ -381,14 +373,28 @@ def main():
     # Add frozen epochs if pruning is enabled
     if args.train_sequential != 'none':
         num_training_epochs = num_layers + args.frozen_epochs
-        freeze_model(model, mask_param_ids)
+        freeze_model(model, mask_param_ids) # turn off model freezing
     else:
         num_training_epochs = args.num_epochs + args.frozen_epochs if args.prune else args.num_epochs
     total_steps = args.num_epochs * len(masked_train_dataloader)
 
+
+    # Add a learning rate scheduler for specifically the masks
+    warmup_frac = 0.1
+    min_scale = 0.2 
+
+    def base_lambda(_step):     # keep base LR constant (or swap your own schedule)
+        return 1.0
+
+    def mask_lambda(step):      # linear with min value
+        min = 0.1
+        return max(min, step / total_steps)
+
+    scheduler = LambdaLR(optimizer, lr_lambda=[base_lambda, mask_lambda])
+
     for epoch in range(num_training_epochs):
         # Freeze masks during the frozen epochs at the end if pruning is enabled
-        is_frozen_epoch = args.prune and (epoch >= args.num_epochs)
+        is_frozen_epoch = args.prune and (epoch + args.frozen_epochs >= num_training_epochs)
         
         if args.train_sequential != 'none' and not is_frozen_epoch:
             with torch.no_grad():
@@ -434,7 +440,7 @@ def main():
             loss.backward()
             
             optimizer.step()
-            # scheduler.step()
+            scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
             epoch_loss += loss.item()
