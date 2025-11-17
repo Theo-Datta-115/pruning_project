@@ -22,6 +22,7 @@ def eval_squad_acc(
     model.eval()
     handles_int = apply_neuron_mask(model, ffn_intermediate_mask, type="ffn_1")
     handles_out = apply_neuron_mask(model, ffn_output_mask, type="ffn_2")
+    # handles_attn = apply_neuron_mask(model, attn_mask, type="attn")
     all_start_logits = []
     all_end_logits = []
     for batch in dataloader:
@@ -38,6 +39,8 @@ def eval_squad_acc(
         handle.remove()
     for handle in handles_out:
         handle.remove()
+    # for handle in handles_attn:
+    #     handle.remove()
 
     max_len = max([x.shape[1] for x in all_start_logits])
     start_logits_concat = create_and_fill_np_array(all_start_logits, eval_dataset, max_len)
@@ -65,6 +68,7 @@ def eval_squad_loss(
     model.eval()
     handles_int = apply_neuron_mask(model, ffn_intermediate_mask, type="ffn_1")
     handles_out = apply_neuron_mask(model, ffn_output_mask, type="ffn_2")
+    handles_attn = apply_neuron_mask(model, attn_mask, type="attn")
     for batch in dataloader:
         for k, v in batch.items():
             batch[k] = v.to("cuda", non_blocking=True)
@@ -74,6 +78,8 @@ def eval_squad_loss(
     for handle in handles_int:
         handle.remove()
     for handle in handles_out:
+        handle.remove()
+    for handle in handles_attn:
         handle.remove()
 
     return loss.avg

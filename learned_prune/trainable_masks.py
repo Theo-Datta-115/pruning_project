@@ -78,6 +78,7 @@ def _wrap_self_attention(attention_module: nn.Module, mask_param: nn.Parameter, 
         else:
             effective_mask = head_mask
         
+        # print(mask_probs)
         return original_forward(
             hidden_states,
             attention_mask,

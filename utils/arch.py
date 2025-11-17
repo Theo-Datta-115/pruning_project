@@ -27,6 +27,10 @@ def get_layers(model):
     layers = encoder.layer
     return layers
 
+def get_attn(model, index):
+    layer = get_layers(model)[index]
+    attn = layer.attention
+    return attn.self
 
 def get_mha_proj(model, index):
     layer = get_layers(model)[index]
@@ -63,9 +67,10 @@ def register_mask(module, mask):
             return (masked_hidden,)
         return (masked_hidden,) + tuple(inputs[1:])
 
+    # print("mask", mask)
+    # print("module", module)
     handle = module.register_forward_pre_hook(hook)
     return handle
-
 
 def apply_neuron_mask(model, neuron_mask, type="ffn_2"):
     # If no mask is provided, return empty handles (no masking)

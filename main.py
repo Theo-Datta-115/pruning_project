@@ -95,8 +95,8 @@ parser.add_argument('--sparsity_loss', type=float, default=0.1, help='Sparsity l
 parser.add_argument('--hard_init', action='store_true', help='Hard Initialization of the Masks')
 parser.add_argument('--masks_LR', type=float, default=1e-2, help='Learning rate for masks')
 parser.add_argument('--learn_masks', type=str, default='ffn_int', 
-                    choices=['head', 'ffn_int', 'ffn_out', 'all'],
-                    help='Which masks to learn: head, ffn_int, ffn_out, or all')
+                    choices=['head', 'ffn_int', 'ffn_out', 'ffns', 'all'],
+                    help='Which masks to learn: head, ffn_int, ffn_out, ffns, or all')
 parser.add_argument('--gumbel_temp_start', type=float, default=1.0, help='Starting Gumbel temperature')
 parser.add_argument('--gumbel_temp_end', type=float, default=0.1, help='Ending Gumbel temperature')
 parser.add_argument('--gumbel_temp_anneal', type=str, default='none', 
@@ -274,8 +274,8 @@ def main():
     if args.prune:
         # Determine which masks to learn
         learn_head = args.learn_masks in ['head', 'all']
-        learn_ffn_int = args.learn_masks in ['ffn_int', 'all']
-        learn_ffn_out = args.learn_masks in ['ffn_out', 'all']
+        learn_ffn_int = args.learn_masks in ['ffn_int', 'ffns', 'all']
+        learn_ffn_out = args.learn_masks in ['ffn_out', 'ffns', 'all']
         
         logger.info("Pruning enabled - using trainable masks")
         # Initialize masks: learned ones get random/hard init, fixed ones get 10 (sigmoid≈1)
@@ -300,18 +300,21 @@ def main():
         model.use_gumbel = (args.gumbel_temp_anneal != 'none')
 
         # Set requires_grad based on which masks we're learning
-        masked_model.head_mask.requires_grad = learn_head and not args.freeze
-        masked_model.ffn_intermediate_mask.requires_grad = learn_ffn_int and not args.freeze
-        masked_model.ffn_output_mask.requires_grad = learn_ffn_out and not args.freeze
+        model.trainable_head_mask.requires_grad = learn_head and not args.freeze
+        model.trainable_ffn_intermediate_mask.requires_grad = learn_ffn_int and not args.freeze
+        model.trainable_ffn_output_mask.requires_grad = learn_ffn_out and not args.freeze
+
+        # print(masked_model.ffn_intermediate_mask)
+        # print(model.trainable_ffn_intermediate_mask)
 
         # Collect trainable mask parameters
         mask_params = [
-            p for p in [masked_model.head_mask, masked_model.ffn_intermediate_mask, masked_model.ffn_output_mask]
+            p for p in [model.trainable_head_mask, model.trainable_ffn_intermediate_mask, model.trainable_ffn_output_mask]
             if p.requires_grad
         ]
         
         # All mask parameters (for exclusion from base_params)
-        all_mask_params = [masked_model.head_mask, masked_model.ffn_intermediate_mask, masked_model.ffn_output_mask]
+        all_mask_params = [model.trainable_head_mask, model.trainable_ffn_intermediate_mask, model.trainable_ffn_output_mask]
         mask_param_ids = {id(p) for p in all_mask_params}
         
         # Base params are everything except the masks
@@ -398,14 +401,14 @@ def main():
         
         if args.train_sequential != 'none' and not is_frozen_epoch:
             with torch.no_grad():
-                device = masked_model.head_mask.device
+                device = model.trainable_head_mask.device
                 # Randomly Init the current layer for the unfreezing
                 if learn_head:
-                    masked_model.head_mask[layer_order[epoch]].copy_(torch.randn(config.num_attention_heads, device=device))
+                    model.trainable_head_mask[layer_order[epoch]].copy_(torch.randn(config.num_attention_heads, device=device))
                 if learn_ffn_int:
-                    masked_model.ffn_intermediate_mask[layer_order[epoch]].copy_(torch.randn(config.hidden_size, device=device))
+                    model.trainable_ffn_intermediate_mask[layer_order[epoch]].copy_(torch.randn(config.hidden_size, device=device))
                 if learn_ffn_out:
-                    masked_model.ffn_output_mask[layer_order[epoch]].copy_(torch.randn(config.intermediate_size, device=device))
+                    model.trainable_ffn_output_mask[layer_order[epoch]].copy_(torch.randn(config.intermediate_size, device=device))
             
             # Unfreeze the layer we are training, and the classifier
             unfreeze_layer(model, layer_order[epoch], unfreeze_head=True)
@@ -415,7 +418,7 @@ def main():
 
         model.train()
         epoch_loss = 0.0
-        for batch in masked_train_dataloader:
+        for idx, batch in enumerate(masked_train_dataloader):
             for key, value in batch.items():
                 batch[key] = value.to("cuda", non_blocking=True)
 
@@ -478,13 +481,8 @@ def main():
                                 log_dict[f"masks/{mask_name}_pct_above_0.95"] = 100 * (m_sig > 0.95).float().mean().item()
                                 log_dict[f"masks/{mask_name}_pct_below_0.05"] = 100 * (m_sig < 0.05).float().mean().item()
 
-                                if args.train_sequential != 'none' and not is_frozen_epoch:
-                                    for idx in range(num_layers):
-                                        log_dict["masks_individual/currently unfreezing"] = layer_order[idx]
-                                        log_dict[f"masks_individual/{mask_name}_pct_below_0.5_{idx}"] = 100 * (m_sig[idx] < 0.5).float().mean().item()
-                                        log_dict[f"masks_individual/{mask_name}_pct_above_0.95_{idx}"] = 100 * (m_sig[idx] > 0.95).float().mean().item()
-                                        log_dict[f"masks_individual/{mask_name}_mean_{idx}"] = m_sig[idx].mean().item()
-                                        log_dict[f"masks_individual/{mask_name}_pct_below_0.05_{idx}"] = 100 * (m_sig[idx] < 0.05).float().mean().item()
+                                for idx in range(num_layers):
+                                    log_dict[f"mask_layer/{mask_name}_pct_below_0.5_{idx}"] = 100 * (m_sig[idx] < 0.5).float().mean().item()
                         
                         wandb.log(log_dict)
                 else:
@@ -497,18 +495,21 @@ def main():
                             "epoch": epoch,
                         })
 
+            if idx == 100:
+                break
+
         # Evaluate at the end of each epoch
         model.eval()
         
         if args.prune:
             # Convert continuous masks to binary: sigmoid(mask) >= 0.5 -> 1, else -> 0
-            head_mask_sigmoid = torch.sigmoid(masked_model.head_mask.detach())
+            head_mask_sigmoid = torch.sigmoid(model.trainable_head_mask.detach())
             head_mask = (head_mask_sigmoid >= 0.5).float()
             
-            ffn_intermediate_mask_sigmoid = torch.sigmoid(masked_model.ffn_intermediate_mask.detach())
+            ffn_intermediate_mask_sigmoid = torch.sigmoid(model.trainable_ffn_intermediate_mask.detach())
             ffn_intermediate_mask = (ffn_intermediate_mask_sigmoid >= 0.5).float()
             
-            ffn_output_mask_sigmoid = torch.sigmoid(masked_model.ffn_output_mask.detach())
+            ffn_output_mask_sigmoid = torch.sigmoid(model.trainable_ffn_output_mask.detach())
             ffn_output_mask = (ffn_output_mask_sigmoid >= 0.5).float()
         else:
             head_mask = None
@@ -517,6 +518,9 @@ def main():
         
         epoch_test_acc = test_accuracy(model, head_mask, ffn_intermediate_mask, ffn_output_mask, tokenizer, args.task_name)
         logger.info(f"Epoch {epoch + 1}/{num_training_epochs} - Test accuracy: {epoch_test_acc:.4f}")
+        # print("counterpoint")
+        # epoch_test_acc = test_accuracy(model, head_mask + 1, ffn_intermediate_mask + 1, ffn_output_mask + 1, tokenizer, args.task_name)
+        # logger.info(f"Epoch {epoch + 1}/{num_training_epochs} - Test accuracy: {epoch_test_acc:.4f}")
         
         if args.wandb:
             wandb.log({
@@ -524,8 +528,6 @@ def main():
                 "epoch": epoch,
                 "global_step": global_step,
             })
-
-    logger.info(f"{args.task_name} Training time (s): {end - start}")
     
     if args.wandb:
         wandb.finish()
