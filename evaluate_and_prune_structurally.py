@@ -34,20 +34,16 @@ logger = logging.getLogger(__name__)
 
 
 def load_saved_model_and_masks(save_dir, model_name, task_name, use_base_model=False):
-    """Load a saved model and its masks from a directory.
+    """Load a saved model and its associated masks.
     
     Args:
-        save_dir: Directory containing saved masks and model weights
-        model_name: Base model name (e.g., 'bert-base-uncased')
-        task_name: Task name (e.g., 'qqp')
-        use_base_model: Whether to load base model architecture
+        save_dir: Directory containing saved model and masks
+        model_name: Base model name (e.g., bert-base-uncased)
+        task_name: Task name (e.g., qqp, mnli)
+        use_base_model: Whether to use base model architecture
         
     Returns:
-        model: Loaded model
-        tokenizer: Tokenizer
-        head_mask: Head attention mask
-        ffn_intermediate_mask: FFN intermediate mask
-        ffn_output_mask: FFN output mask
+        model, tokenizer, config, head_mask, ffn_mask
     """
     # Load the base model architecture
     default_root = "/n/netscratch/sham_lab/Everyone/tdatta/pruning/checkpoints/"
@@ -73,27 +69,21 @@ def load_saved_model_and_masks(save_dir, model_name, task_name, use_base_model=F
     else:
         logger.warning(f"No model weights found at {weights_path}, using base model")
     
-    # Load the masks
+    # Load masks
     head_mask_path = os.path.join(save_dir, "head_mask.pt")
-    ffn_int_mask_path = os.path.join(save_dir, "ffn_intermediate_mask.pt")
-    ffn_out_mask_path = os.path.join(save_dir, "ffn_output_mask.pt")
+    ffn_mask_path = os.path.join(save_dir, "ffn_mask.pt")
     
     head_mask = torch.load(head_mask_path) if os.path.exists(head_mask_path) else None
-    ffn_intermediate_mask = torch.load(ffn_int_mask_path) if os.path.exists(ffn_int_mask_path) else None
-    ffn_output_mask = torch.load(ffn_out_mask_path) if os.path.exists(ffn_out_mask_path) else None
+    ffn_mask = torch.load(ffn_mask_path) if os.path.exists(ffn_mask_path) else None
     
-    logger.info(f"Loaded masks from {save_dir}")
-    if head_mask is not None:
-        logger.info(f"  Head mask shape: {head_mask.shape}, sparsity: {(head_mask == 0).float().mean():.2%}")
-    if ffn_intermediate_mask is not None:
-        logger.info(f"  FFN intermediate mask shape: {ffn_intermediate_mask.shape}, sparsity: {(ffn_intermediate_mask == 0).float().mean():.2%}")
-    if ffn_output_mask is not None:
-        logger.info(f"  FFN output mask shape: {ffn_output_mask.shape}, sparsity: {(ffn_output_mask == 0).float().mean():.2%}")
+    logger.info(f"Loaded masks:")
+    logger.info(f"  Head mask: {head_mask.shape if head_mask is not None else 'None'}")
+    logger.info(f"  FFN mask: {ffn_mask.shape if ffn_mask is not None else 'None'}")
     
-    return model, tokenizer, config, head_mask, ffn_intermediate_mask, ffn_output_mask
+    return model, tokenizer, config, head_mask, ffn_mask
 
 
-def create_structurally_pruned_model(model, config, head_mask, ffn_intermediate_mask, ffn_output_mask):
+def create_structurally_pruned_model(model, config, head_mask, ffn_mask):
     """Create a smaller model by structurally removing zero-masked neurons.
     
     This function creates a new model with reduced dimensions based on the masks.
@@ -103,8 +93,7 @@ def create_structurally_pruned_model(model, config, head_mask, ffn_intermediate_
         model: Original model
         config: Model configuration
         head_mask: Head attention mask [num_layers, num_heads]
-        ffn_intermediate_mask: FFN intermediate mask [num_layers, hidden_size]
-        ffn_output_mask: FFN output mask [num_layers, intermediate_size]
+        ffn_mask: FFN mask [num_layers, intermediate_size]
         
     Returns:
         pruned_model: New model with reduced structure
@@ -147,9 +136,9 @@ def create_structurally_pruned_model(model, config, head_mask, ffn_intermediate_
         orig_ffn2_weight = orig_ffn2.dense.weight.data  # [hidden_size, intermediate_size]
         orig_ffn2_bias = orig_ffn2.dense.bias.data if orig_ffn2.dense.bias is not None else None
         
-        # FFN output mask: which intermediate neurons to keep
-        if ffn_output_mask is not None:
-            intermediate_mask = ffn_output_mask[layer_idx]  # [intermediate_size]
+        # FFN mask: which intermediate neurons to keep
+        if ffn_mask is not None:
+            intermediate_mask = ffn_mask[layer_idx]  # [intermediate_size]
             intermediate_kept_indices = (intermediate_mask > 0).nonzero(as_tuple=True)[0]
         else:
             intermediate_kept_indices = torch.arange(orig_ffn1_weight.shape[0])
@@ -189,6 +178,9 @@ def create_structurally_pruned_model(model, config, head_mask, ffn_intermediate_
         sparsity = 1 - len(intermediate_kept_indices) / orig_ffn1_weight.shape[0]
         logger.info(f"  Layer {layer_idx}: FFN intermediate neurons {orig_ffn1_weight.shape[0]} -> "
                    f"{len(intermediate_kept_indices)} (sparsity: {sparsity:.1%})")
+    
+    # Note: We only structurally prune the intermediate dimension
+    # The ffn_mask is already applied during training via hooks on FFN2
     
     # Count parameters
     orig_params = sum(p.numel() for p in model.parameters())
@@ -237,7 +229,7 @@ def main():
     logger.info(f"Loading model from {save_dir}")
     
     # Load the saved model and masks
-    model, tokenizer, config, head_mask, ffn_intermediate_mask, ffn_output_mask = load_saved_model_and_masks(
+    model, tokenizer, config, head_mask, ffn_mask = load_saved_model_and_masks(
         save_dir, args.model_name, args.task_name, args.use_base_model
     )
     
@@ -247,10 +239,8 @@ def main():
     # Move masks to GPU
     if head_mask is not None:
         head_mask = head_mask.cuda()
-    if ffn_intermediate_mask is not None:
-        ffn_intermediate_mask = ffn_intermediate_mask.cuda()
-    if ffn_output_mask is not None:
-        ffn_output_mask = ffn_output_mask.cuda()
+    if ffn_mask is not None:
+        ffn_mask = ffn_mask.cuda()
     
     # Evaluate the original model with masks
     logger.info("\n" + "="*80)
@@ -258,7 +248,7 @@ def main():
     logger.info("="*80)
     
     masked_accuracy = test_accuracy(
-        model, head_mask, ffn_intermediate_mask, ffn_output_mask,
+        model, head_mask, ffn_mask,
         tokenizer, args.task_name
     )
     logger.info(f"Masked model accuracy: {masked_accuracy:.4f}")
@@ -287,12 +277,11 @@ def main():
     logger.info("="*80)
     
     pruned_model, pruned_config = create_structurally_pruned_model(
-        model, config, head_mask, ffn_intermediate_mask, ffn_output_mask
+        model, config, head_mask, ffn_mask
     )
     
     pruned_model = pruned_model.cuda()
     pruned_model.eval()
-    print(pruned_model)
     
     # Evaluate the structurally pruned model (no masks needed)
     logger.info("\n" + "="*80)

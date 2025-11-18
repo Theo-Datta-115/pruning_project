@@ -94,9 +94,9 @@ parser.add_argument('--quantization_loss', type=float, default=0.01, help='Quant
 parser.add_argument('--sparsity_loss', type=float, default=0.1, help='Sparsity loss weight')
 parser.add_argument('--hard_init', action='store_true', help='Hard Initialization of the Masks')
 parser.add_argument('--masks_LR', type=float, default=1e-2, help='Learning rate for masks')
-parser.add_argument('--learn_masks', type=str, default='ffn_int', 
-                    choices=['head', 'ffn_int', 'ffn_out', 'ffns', 'all'],
-                    help='Which masks to learn: head, ffn_int, ffn_out, ffns, or all')
+parser.add_argument('--learn_masks', type=str, default='ffn', 
+                    choices=['head', 'ffn', 'all'],
+                    help='Which masks to learn: head, ffn, or all')
 parser.add_argument('--gumbel_temp_start', type=float, default=1.0, help='Starting Gumbel temperature')
 parser.add_argument('--gumbel_temp_end', type=float, default=0.1, help='Ending Gumbel temperature')
 parser.add_argument('--gumbel_temp_anneal', type=str, default='none', 
@@ -110,22 +110,20 @@ parser.add_argument('--masks_reinit_percent', type=float, default=0.2,
                     help='Percentage of low-value masks to reinitialize (default 0.1 = 10%%)')
 parser.add_argument('--train_sequential', type=str, default='none', choices=['front_to_back', 'back_to_front', 'random', 'none'])
 
-def reinitialize_low_masks(model, learn_head, learn_ffn_int, learn_ffn_out, reinit_percent=0.1, threshold=0.5):
+def reinitialize_low_masks(model, learn_head, learn_ffn, reinit_percent=0.1, threshold=0.5):
     """Reinitialize a random percentage of mask values below threshold.
     
     Args:
         model: Model with trainable masks
         learn_head: Whether head masks are being learned
-        learn_ffn_int: Whether FFN intermediate masks are being learned
-        learn_ffn_out: Whether FFN output masks are being learned
+        learn_ffn: Whether FFN masks are being learned
         reinit_percent: Percentage of low-value masks to reinitialize (default 0.1 = 10%)
         threshold: Sigmoid threshold below which masks are candidates for reinitialization (default 0.5)
     """
     with torch.no_grad():
         for mask_name, mask_tensor, is_active in [
             ('head', model.trainable_head_mask, learn_head),
-            ('ffn_int', model.trainable_ffn_intermediate_mask, learn_ffn_int),
-            ('ffn_out', model.trainable_ffn_output_mask, learn_ffn_out),
+            ('ffn', model.trainable_ffn_mask, learn_ffn),
         ]:
             if is_active:
                 mask_sigmoid = torch.sigmoid(mask_tensor)
@@ -146,7 +144,7 @@ def reinitialize_low_masks(model, learn_head, learn_ffn_int, learn_ffn_out, rein
                     
                     logger.info(f"Reinitialized {num_to_reinit}/{num_low} low-value {mask_name} masks")
 
-def compute_mask_losses(model, learn_head, learn_ffn_int, learn_ffn_out, temperature, layer_order, epoch, train_sequential):
+def compute_mask_losses(model, learn_head, learn_ffn, temperature, layer_order, epoch, train_sequential):
     """Compute sparsity and quantization losses for active masks."""
     sparsity_loss = 0.0
     quantization_loss = 0.0
@@ -154,8 +152,7 @@ def compute_mask_losses(model, learn_head, learn_ffn_int, learn_ffn_out, tempera
     
     for mask_name, mask_tensor, is_active in [
         ('head', model.trainable_head_mask, learn_head),
-        ('ffn_int', model.trainable_ffn_intermediate_mask, learn_ffn_int),
-        ('ffn_out', model.trainable_ffn_output_mask, learn_ffn_out),
+        ('ffn', model.trainable_ffn_mask, learn_ffn),
     ]:
         if is_active:
             mask_sigmoid = torch.sigmoid(mask_tensor) # no temperature built in
@@ -274,8 +271,7 @@ def main():
     if args.prune:
         # Determine which masks to learn
         learn_head = args.learn_masks in ['head', 'all']
-        learn_ffn_int = args.learn_masks in ['ffn_int', 'ffns', 'all']
-        learn_ffn_out = args.learn_masks in ['ffn_out', 'ffns', 'all']
+        learn_ffn = args.learn_masks in ['ffn', 'all']
         
         logger.info("Pruning enabled - using trainable masks")
         # Initialize masks: learned ones get random/hard init, fixed ones get 10 (sigmoid≈1)
@@ -286,14 +282,12 @@ def main():
                 return torch.ones(*shape).cuda() * 10
         
         full_head_mask = init_mask((config.num_hidden_layers, config.num_attention_heads), learn_head)
-        full_ffn_intermediate_mask = init_mask((config.num_hidden_layers, config.hidden_size), learn_ffn_int)
-        full_ffn_output_mask = init_mask((config.num_hidden_layers, config.intermediate_size), learn_ffn_out)
+        full_ffn_mask = init_mask((config.num_hidden_layers, config.intermediate_size), learn_ffn)
 
         masked_model = make_masks_trainable(
             model,
             head_mask=full_head_mask,
-            ffn_intermediate_mask=full_ffn_intermediate_mask,
-            ffn_output_mask=full_ffn_output_mask,
+            ffn_mask=full_ffn_mask,
         )
         
         # Initialize Gumbel settings
@@ -301,20 +295,19 @@ def main():
 
         # Set requires_grad based on which masks we're learning
         model.trainable_head_mask.requires_grad = learn_head and not args.freeze
-        model.trainable_ffn_intermediate_mask.requires_grad = learn_ffn_int and not args.freeze
-        model.trainable_ffn_output_mask.requires_grad = learn_ffn_out and not args.freeze
+        model.trainable_ffn_mask.requires_grad = learn_ffn and not args.freeze
 
         # print(masked_model.ffn_intermediate_mask)
         # print(model.trainable_ffn_intermediate_mask)
 
         # Collect trainable mask parameters
         mask_params = [
-            p for p in [model.trainable_head_mask, model.trainable_ffn_intermediate_mask, model.trainable_ffn_output_mask]
+            p for p in [model.trainable_head_mask, model.trainable_ffn_mask]
             if p.requires_grad
         ]
         
         # All mask parameters (for exclusion from base_params)
-        all_mask_params = [model.trainable_head_mask, model.trainable_ffn_intermediate_mask, model.trainable_ffn_output_mask]
+        all_mask_params = [model.trainable_head_mask, model.trainable_ffn_mask]
         mask_param_ids = {id(p) for p in all_mask_params}
         
         # Base params are everything except the masks
@@ -405,10 +398,8 @@ def main():
                 # Randomly Init the current layer for the unfreezing
                 if learn_head:
                     model.trainable_head_mask[layer_order[epoch]].copy_(torch.randn(config.num_attention_heads, device=device))
-                if learn_ffn_int:
-                    model.trainable_ffn_intermediate_mask[layer_order[epoch]].copy_(torch.randn(config.hidden_size, device=device))
-                if learn_ffn_out:
-                    model.trainable_ffn_output_mask[layer_order[epoch]].copy_(torch.randn(config.intermediate_size, device=device))
+                if learn_ffn:
+                    model.trainable_ffn_mask[layer_order[epoch]].copy_(torch.randn(config.intermediate_size, device=device))
             
             # Unfreeze the layer we are training, and the classifier
             unfreeze_layer(model, layer_order[epoch], unfreeze_head=True)
@@ -434,7 +425,7 @@ def main():
             outputs = model(**batch)
             
             if args.prune and not is_frozen_epoch:
-                sparsity_loss, quantization_loss = compute_mask_losses(model, learn_head, learn_ffn_int, learn_ffn_out, current_temp, layer_order, epoch, args.train_sequential)
+                sparsity_loss, quantization_loss = compute_mask_losses(model, learn_head, learn_ffn, current_temp, layer_order, epoch, args.train_sequential)
             else:
                 sparsity_loss = torch.tensor(0.0)
                 quantization_loss = torch.tensor(0.0)
@@ -451,7 +442,7 @@ def main():
             
             # Reinitialize low-value masks every 500 steps if enabled
             if args.prune and args.masks_reinit and global_step % 500 == 0 and epoch < args.num_epochs - 1:
-                reinitialize_low_masks(model, learn_head, learn_ffn_int, learn_ffn_out, reinit_percent=args.masks_reinit_percent)
+                reinitialize_low_masks(model, learn_head, learn_ffn, reinit_percent=args.masks_reinit_percent)
 
             if args.log_loss_every > 0 and global_step % args.log_loss_every == 0:
                 if args.prune:
@@ -471,8 +462,7 @@ def main():
                         
                         for mask_name, mask_tensor, is_active in [
                             ('head', model.trainable_head_mask, learn_head),
-                            ('ffn_int', model.trainable_ffn_intermediate_mask, learn_ffn_int),
-                            ('ffn_out', model.trainable_ffn_output_mask, learn_ffn_out),
+                            ('ffn', model.trainable_ffn_mask, learn_ffn),
                         ]:
                             if is_active:
                                 m_sig = torch.sigmoid(mask_tensor)
@@ -506,17 +496,13 @@ def main():
             head_mask_sigmoid = torch.sigmoid(model.trainable_head_mask.detach())
             head_mask = (head_mask_sigmoid >= 0.5).float()
             
-            ffn_intermediate_mask_sigmoid = torch.sigmoid(model.trainable_ffn_intermediate_mask.detach())
-            ffn_intermediate_mask = (ffn_intermediate_mask_sigmoid >= 0.5).float()
-            
-            ffn_output_mask_sigmoid = torch.sigmoid(model.trainable_ffn_output_mask.detach())
-            ffn_output_mask = (ffn_output_mask_sigmoid >= 0.5).float()
+            ffn_mask_sigmoid = torch.sigmoid(model.trainable_ffn_mask.detach())
+            ffn_mask = (ffn_mask_sigmoid >= 0.5).float()
         else:
             head_mask = None
-            ffn_intermediate_mask = None
-            ffn_output_mask = None
+            ffn_mask = None
         
-        epoch_test_acc = test_accuracy(model, head_mask, ffn_intermediate_mask, ffn_output_mask, tokenizer, args.task_name)
+        epoch_test_acc = test_accuracy(model, head_mask, ffn_mask, tokenizer, args.task_name)
         logger.info(f"Epoch {epoch + 1}/{num_training_epochs} - Test accuracy: {epoch_test_acc:.4f}")
         # print("counterpoint")
         # epoch_test_acc = test_accuracy(model, head_mask + 1, ffn_intermediate_mask + 1, ffn_output_mask + 1, tokenizer, args.task_name)
@@ -544,8 +530,7 @@ def main():
         
         os.makedirs(save_dir, exist_ok=True)
         torch.save(head_mask.cpu(), os.path.join(save_dir, "head_mask.pt"))
-        torch.save(ffn_intermediate_mask.cpu(), os.path.join(save_dir, "ffn_intermediate_mask.pt"))
-        torch.save(ffn_output_mask.cpu(), os.path.join(save_dir, "ffn_output_mask.pt"))
+        torch.save(ffn_mask.cpu(), os.path.join(save_dir, "ffn_mask.pt"))
         torch.save(model.state_dict(), os.path.join(save_dir, "model_weights.pt"))
 
         logger.info(f"Masks saved to {save_dir}")

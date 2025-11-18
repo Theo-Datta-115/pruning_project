@@ -10,8 +10,7 @@ from utils.meter import AverageMeter
 def eval_squad_acc(
     model,
     head_mask,
-    ffn_intermediate_mask, 
-    ffn_output_mask,
+    ffn_mask,
     dataloader,
     eval_dataset,
     eval_examples,
@@ -20,9 +19,7 @@ def eval_squad_acc(
     metric = load_metric(task_name)
 
     model.eval()
-    handles_int = apply_neuron_mask(model, ffn_intermediate_mask, type="ffn_1")
-    handles_out = apply_neuron_mask(model, ffn_output_mask, type="ffn_2")
-    # handles_attn = apply_neuron_mask(model, attn_mask, type="attn")
+    handles_ffn = apply_neuron_mask(model, ffn_mask, type="ffn_2")
     all_start_logits = []
     all_end_logits = []
     for batch in dataloader:
@@ -35,12 +32,8 @@ def eval_squad_acc(
 
         all_start_logits.append(start_logits.cpu().numpy())
         all_end_logits.append(end_logits.cpu().numpy())
-    for handle in handles_int:
+    for handle in handles_ffn:
         handle.remove()
-    for handle in handles_out:
-        handle.remove()
-    # for handle in handles_attn:
-    #     handle.remove()
 
     max_len = max([x.shape[1] for x in all_start_logits])
     start_logits_concat = create_and_fill_np_array(all_start_logits, eval_dataset, max_len)
@@ -59,27 +52,20 @@ def eval_squad_acc(
 def eval_squad_loss(
     model,
     head_mask,
-    ffn_intermediate_mask, 
-    ffn_output_mask,
+    ffn_mask,
     dataloader,
 ):
     loss = AverageMeter("squad_loss")
 
     model.eval()
-    handles_int = apply_neuron_mask(model, ffn_intermediate_mask, type="ffn_1")
-    handles_out = apply_neuron_mask(model, ffn_output_mask, type="ffn_2")
-    handles_attn = apply_neuron_mask(model, attn_mask, type="attn")
+    handles_ffn = apply_neuron_mask(model, ffn_mask, type="ffn_2")
     for batch in dataloader:
         for k, v in batch.items():
             batch[k] = v.to("cuda", non_blocking=True)
 
         outputs = model(head_mask=head_mask, **batch)
         loss.update(outputs.loss, n=batch["input_ids"].shape[0])
-    for handle in handles_int:
-        handle.remove()
-    for handle in handles_out:
-        handle.remove()
-    for handle in handles_attn:
+    for handle in handles_ffn:
         handle.remove()
 
     return loss.avg

@@ -25,15 +25,12 @@ class TrainableMaskHandles:
     ----------
     head_mask : torch.nn.Parameter | None
         Trainable head mask registered on the model (``None`` if not supplied).
-    ffn_intermediate_mask : torch.nn.Parameter | None
-        Trainable mask applied to the intermediate feed-forward activations.
-    ffn_output_mask : torch.nn.Parameter | None
-        Trainable mask applied to the feed-forward output activations.
+    ffn_mask : torch.nn.Parameter | None
+        Trainable mask applied to the feed-forward intermediate activations.
     """
 
     head_mask: Optional[nn.Parameter]
-    ffn_intermediate_mask: Optional[nn.Parameter]
-    ffn_output_mask: Optional[nn.Parameter]
+    ffn_mask: Optional[nn.Parameter]
 
 
 def _ensure_parameter(module: nn.Module, name: str, value: torch.Tensor) -> nn.Parameter:
@@ -93,27 +90,8 @@ def _wrap_self_attention(attention_module: nn.Module, mask_param: nn.Parameter, 
     attention_module._trainable_mask_wrapped = True
 
 
-def _wrap_ffn_intermediate(intermediate_module: nn.Module, mask_param: nn.Parameter, layer_idx: int, model: nn.Module) -> None:
-    """Multiply intermediate activations by a trainable mask before passing downstream."""
-    if getattr(intermediate_module, "_trainable_mask_wrapped", False):
-        return
-
-    original_forward = intermediate_module.forward
-
-    def forward(self, hidden_states, *args, **kwargs):
-        if self.training:
-            mask = mask_param[layer_idx].to(hidden_states.device, hidden_states.dtype).view(1, 1, -1)
-            temperature = getattr(model, "gumbel_temperature", 1.0)
-            use_gumbel  = getattr(model, "use_gumbel", True)
-            hidden_states = hidden_states * gumbel_sigmoid(mask, temperature=temperature, training=True, use_gumbel=use_gumbel)
-        return original_forward(hidden_states, *args, **kwargs)
-
-    intermediate_module.forward = forward.__get__(intermediate_module, intermediate_module.__class__)
-    intermediate_module._trainable_mask_wrapped = True
-
-
-def _wrap_ffn_output(output_module: nn.Module, mask_param: nn.Parameter, layer_idx: int, model: nn.Module) -> None:
-    """Apply a trainable mask to the pre-projection FFN activations."""
+def _wrap_ffn(output_module: nn.Module, mask_param: nn.Parameter, layer_idx: int, model: nn.Module) -> None:
+    """Apply a trainable mask to the FFN intermediate activations."""
     if getattr(output_module, "_trainable_mask_wrapped", False):
         return
 
@@ -134,8 +112,7 @@ def make_masks_trainable(
     model: nn.Module,
     *,
     head_mask: Optional[torch.Tensor] = None,
-    ffn_intermediate_mask: Optional[torch.Tensor] = None,
-    ffn_output_mask: Optional[torch.Tensor] = None,
+    ffn_mask: Optional[torch.Tensor] = None,
 ) -> TrainableMaskHandles:
     """Promote binary masks to trainable parameters and integrate them into ``model``.
 
@@ -146,12 +123,9 @@ def make_masks_trainable(
     head_mask:
         Optional tensor of shape ``[num_layers, num_heads]``. When provided, each layer's
         attention head outputs are modulated by a learnable parameter vector.
-    ffn_intermediate_mask:
-        Optional tensor of shape ``[num_layers, hidden_size]``. Each element scales the
-        post-activation hidden representation before entering the intermediate linear.
-    ffn_output_mask:
+    ffn_mask:
         Optional tensor of shape ``[num_layers, intermediate_size]`` used to scale the
-        intermediate activations prior to the FFN output projection.
+        intermediate activations in the FFN.
 
     Returns
     -------
@@ -163,8 +137,7 @@ def make_masks_trainable(
     dtype = next(model.parameters()).dtype
 
     head_param: Optional[nn.Parameter] = None
-    ffn_intermediate_param: Optional[nn.Parameter] = None
-    ffn_output_param: Optional[nn.Parameter] = None
+    ffn_param: Optional[nn.Parameter] = None
 
     # Initialize Gumbel temperature and use_gumbel flag on the model
     if not hasattr(model, 'gumbel_temperature'):
@@ -177,28 +150,17 @@ def make_masks_trainable(
         for idx, layer in enumerate(get_layers(model)):
             _wrap_self_attention(layer.attention.self, head_param, idx, model)
 
-    if ffn_intermediate_mask is not None:
-        ffn_intermediate_param = _ensure_parameter(
+    if ffn_mask is not None:
+        ffn_param = _ensure_parameter(
             model,
-            "trainable_ffn_intermediate_mask",
-            ffn_intermediate_mask.to(device=device, dtype=dtype),
+            "trainable_ffn_mask",
+            ffn_mask.to(device=device, dtype=dtype),
         )
-        for idx in range(ffn_intermediate_param.shape[0]):
-            intermediate_module = get_ffn1(model, idx)
-            _wrap_ffn_intermediate(intermediate_module, ffn_intermediate_param, idx, model)
-
-    if ffn_output_mask is not None:
-        ffn_output_param = _ensure_parameter(
-            model,
-            "trainable_ffn_output_mask",
-            ffn_output_mask.to(device=device, dtype=dtype),
-        )
-        for idx in range(ffn_output_param.shape[0]):
+        for idx in range(ffn_param.shape[0]):
             output_module = get_ffn2(model, idx)
-            _wrap_ffn_output(output_module, ffn_output_param, idx, model)
+            _wrap_ffn(output_module, ffn_param, idx, model)
 
     return TrainableMaskHandles(
         head_mask=head_param,
-        ffn_intermediate_mask=ffn_intermediate_param,
-        ffn_output_mask=ffn_output_param,
+        ffn_mask=ffn_param,
     )
