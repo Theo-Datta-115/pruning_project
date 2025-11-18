@@ -495,8 +495,8 @@ def main():
                             "epoch": epoch,
                         })
 
-            if idx == 100:
-                break
+            # if idx == 100:
+            #     break
 
         # Evaluate at the end of each epoch
         model.eval()
@@ -546,6 +546,8 @@ def main():
         torch.save(head_mask.cpu(), os.path.join(save_dir, "head_mask.pt"))
         torch.save(ffn_intermediate_mask.cpu(), os.path.join(save_dir, "ffn_intermediate_mask.pt"))
         torch.save(ffn_output_mask.cpu(), os.path.join(save_dir, "ffn_output_mask.pt"))
+        torch.save(model.state_dict(), os.path.join(save_dir, "model_weights.pt"))
+
         logger.info(f"Masks saved to {save_dir}")
 
 if __name__ == "__main__":
