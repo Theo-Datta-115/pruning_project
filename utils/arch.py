@@ -149,3 +149,44 @@ def collect_layer_inputs(
             inputs.append(batch)
 
     return inputs
+
+
+def count_parameters(module):
+    """Count total parameters in a module."""
+    return sum(p.numel() for p in module.parameters())
+
+
+def get_attention_param_ratio(model):
+    """
+    Calculate the ratio between FFN block parameters and attention block parameters in a transformer model.
+    
+    Args:
+        model: A transformer model (e.g., BERT)
+        
+    Returns:
+        float: Ratio of FFN parameters to attention parameters (FFN_params / attention_params)
+    """
+    total_ffn_params = 0
+    total_attention_params = 0
+    
+    # Get all layers
+    layers = get_layers(model)
+    num_layers = len(layers)
+    
+    for layer_idx in range(num_layers):
+        # FFN parameters (intermediate + output layers)
+        ffn1 = get_ffn1(model, layer_idx)  # intermediate dense layer
+        ffn2 = get_ffn2(model, layer_idx)  # output dense layer
+        total_ffn_params += count_parameters(ffn1) + count_parameters(ffn2)
+        
+        # Attention parameters (query, key, value, and output projection)
+        attn = get_attn(model, layer_idx)  # self-attention (contains query, key, value)
+        mha_proj = get_mha_proj(model, layer_idx)  # attention output projection
+        total_attention_params += count_parameters(attn) + count_parameters(mha_proj)
+    
+    # Calculate ratio
+    if total_attention_params == 0:
+        return float('inf')  # Avoid division by zero
+    
+    ratio = total_attention_params / total_ffn_params
+    return ratio

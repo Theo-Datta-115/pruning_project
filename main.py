@@ -49,6 +49,7 @@ from evaluate_model.nlp import test_accuracy
 from utils.schedule import get_pruning_schedule, gumbel_sigmoid, get_gumbel_temperature
 from learned_prune.trainable_masks import make_masks_trainable
 from utils.model_loader import load_model_and_tokenizer, unfreeze_layer, unfreeze_model, freeze_model
+from utils.arch import get_attention_param_ratio
 
 
 logger = logging.getLogger(__name__)
@@ -109,6 +110,7 @@ parser.add_argument('--masks_reinit', action='store_true',
 parser.add_argument('--masks_reinit_percent', type=float, default=0.2, 
                     help='Percentage of low-value masks to reinitialize (default 0.1 = 10%%)')
 parser.add_argument('--train_sequential', type=str, default='none', choices=['front_to_back', 'back_to_front', 'random', 'none'])
+parser.add_argument('--keep_percent', type=float, default=0.5, help='Keep percentage')
 
 def reinitialize_low_masks(model, learn_head, learn_ffn, reinit_percent=0.1, threshold=0.5):
     """Reinitialize a random percentage of mask values below threshold.
@@ -144,7 +146,7 @@ def reinitialize_low_masks(model, learn_head, learn_ffn, reinit_percent=0.1, thr
                     
                     logger.info(f"Reinitialized {num_to_reinit}/{num_low} low-value {mask_name} masks")
 
-def compute_mask_losses(model, learn_head, learn_ffn, temperature, layer_order, epoch, train_sequential):
+def compute_mask_losses(model, learn_head, learn_ffn, temperature, layer_order, epoch, train_sequential, keep_percent):
     """Compute sparsity and quantization losses for active masks."""
     sparsity_loss = 0.0
     quantization_loss = 0.0
@@ -155,23 +157,29 @@ def compute_mask_losses(model, learn_head, learn_ffn, temperature, layer_order, 
         ('ffn', model.trainable_ffn_mask, learn_ffn),
     ]:
         if is_active:
+            weight_factor = get_attention_param_ratio(model) if mask_name == 'head' else 1
+            
             mask_sigmoid = torch.sigmoid(mask_tensor) # no temperature built in
             
             if train_sequential != 'none':
                 mask_sigmoid = mask_sigmoid[layer_order[:epoch + 1]]
 
-            sparsity_loss += torch.mean(mask_sigmoid)
+            layer_spars_losses = torch.zeros(len(mask_sigmoid))
+            for i, layer in enumerate(mask_sigmoid):
+                layer_spars_losses[i] = (torch.abs(torch.mean(layer) - keep_percent))
+            sparsity_loss = torch.mean(layer_spars_losses)
+
+            # sparsity_loss += (weight_factor * torch.abs(torch.mean(mask_sigmoid) - keep_percent))
             
             mask_clamped = torch.clamp(mask_sigmoid, 1e-7, 1 - 1e-7)
-            quantization_loss += torch.mean(
+            quantization_loss += (weight_factor * torch.mean(
                 -torch.log(mask_clamped) * mask_clamped - 
                 torch.log(1 - mask_clamped) * (1 - mask_clamped)
-            )
-            num_active += 1
+            ))
     
-    if num_active > 0:
-        sparsity_loss /= num_active
-        quantization_loss /= num_active
+    if learn_head:
+        sparsity_loss /= (1 + get_attention_param_ratio(model))
+        quantization_loss /= (1 + get_attention_param_ratio(model))
     
     return sparsity_loss, quantization_loss
 
@@ -267,6 +275,10 @@ def main():
 
     # Prepare the model
     model = model.cuda()
+    
+    # Test the FFN attention ratio function
+    ratio = get_attention_param_ratio(model)
+    logger.info(f"Attention to FFN parameter ratio: {ratio:.4f}")
 
     if args.prune:
         # Determine which masks to learn
@@ -425,7 +437,7 @@ def main():
             outputs = model(**batch)
             
             if args.prune and not is_frozen_epoch:
-                sparsity_loss, quantization_loss = compute_mask_losses(model, learn_head, learn_ffn, current_temp, layer_order, epoch, args.train_sequential)
+                sparsity_loss, quantization_loss = compute_mask_losses(model, learn_head, learn_ffn, current_temp, layer_order, epoch, args.train_sequential, args.keep_percent)
             else:
                 sparsity_loss = torch.tensor(0.0)
                 quantization_loss = torch.tensor(0.0)
