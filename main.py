@@ -164,12 +164,14 @@ def compute_mask_losses(model, learn_head, learn_ffn, temperature, layer_order, 
             if train_sequential != 'none':
                 mask_sigmoid = mask_sigmoid[layer_order[:epoch + 1]]
 
-            layer_spars_losses = torch.zeros(len(mask_sigmoid))
-            for i, layer in enumerate(mask_sigmoid):
-                layer_spars_losses[i] = (torch.abs(torch.mean(layer) - keep_percent))
-            sparsity_loss = torch.mean(layer_spars_losses)
+            # # Compute per-layer mean and then MSE loss to target sparsity
+            # layer_means = mask_sigmoid.mean(dim=-1)  # Shape: [num_layers]
+            # layer_spars_losses = torch.abs(layer_means - keep_percent)
+            # sparsity_loss = weight_factor * torch.mean(layer_spars_losses)
 
-            # sparsity_loss += (weight_factor * torch.abs(torch.mean(mask_sigmoid) - keep_percent))
+            sparsity_loss += weight_factor * torch.mean(mask_sigmoid)
+            
+            # (weight_factor * torch.abs(torch.mean(mask_sigmoid) - keep_percent))
             
             mask_clamped = torch.clamp(mask_sigmoid, 1e-7, 1 - 1e-7)
             quantization_loss += (weight_factor * torch.mean(
@@ -180,6 +182,9 @@ def compute_mask_losses(model, learn_head, learn_ffn, temperature, layer_order, 
     if learn_head:
         sparsity_loss /= (1 + get_attention_param_ratio(model))
         quantization_loss /= (1 + get_attention_param_ratio(model))
+
+    # Push toward target value, across model
+    sparsity_loss = torch.abs(sparsity_loss - keep_percent)
     
     return sparsity_loss, quantization_loss
 
@@ -289,7 +294,7 @@ def main():
         # Initialize masks: learned ones get random/hard init, fixed ones get 10 (sigmoid≈1)
         def init_mask(shape, learn):
             if learn and (not args.hard_init) and (args.train_sequential == 'none'):
-                return torch.randn(*shape).cuda()
+                return torch.zeros(*shape).cuda()
             else:
                 return torch.ones(*shape).cuda() * 10
         
@@ -544,6 +549,9 @@ def main():
         torch.save(head_mask.cpu(), os.path.join(save_dir, "head_mask.pt"))
         torch.save(ffn_mask.cpu(), os.path.join(save_dir, "ffn_mask.pt"))
         torch.save(model.state_dict(), os.path.join(save_dir, "model_weights.pt"))
+        
+        # Save config for compatibility with analyze_param_usage.py
+        # config.save_pretrained(save_dir)
 
         logger.info(f"Masks saved to {save_dir}")
 

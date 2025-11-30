@@ -10,6 +10,7 @@ divided into attention (self- and output projections), feed-forward (intermediat
 and output) and LayerNorm parameters to highlight what portion of the encoder is
 allocated to each sub-module.
 
+python analyze_param_usage.py /n/netscratch/sham_lab/Everyone/tdatta/pruning/outputs/layerwise_9_sq 
 """
 from __future__ import annotations
 

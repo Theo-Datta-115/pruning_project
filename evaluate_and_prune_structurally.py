@@ -8,7 +8,7 @@ This script:
 4. Evaluates the structurally pruned model
 
 Usage:
-    python evaluate_and_prune_structurally.py --save_name curve1_save --model_name bert-base-uncased --task_name qqp
+    python evaluate_and_prune_structurally.py --save_name all_flatinit_5 --model_name bert-base-uncased --task_name qqp
 """
 
 import argparse
@@ -28,7 +28,7 @@ from transformers import (
 
 from evaluate_model.nlp import test_accuracy
 from utils.model_loader import load_model_and_tokenizer
-from utils.arch import get_layers, get_ffn1, get_ffn2
+from utils.arch import get_layers, get_ffn1, get_ffn2, get_attn, get_mha_proj
 
 logger = logging.getLogger(__name__)
 
@@ -84,16 +84,17 @@ def load_saved_model_and_masks(save_dir, model_name, task_name, use_base_model=F
 
 
 def create_structurally_pruned_model(model, config, head_mask, ffn_mask):
-    """Create a smaller model by structurally removing zero-masked neurons.
+    """Create a smaller model by structurally removing zero-masked components.
     
     This function creates a new model with reduced dimensions based on the masks.
-    For FFN layers, it removes neurons that are masked out (mask value = 0).
+    - For attention heads: removes entire heads that are masked out (mask value = 0)
+    - For FFN layers: removes intermediate neurons that are masked out (mask value = 0)
     
     Args:
         model: Original model
         config: Model configuration
-        head_mask: Head attention mask [num_layers, num_heads]
-        ffn_mask: FFN mask [num_layers, intermediate_size]
+        head_mask: Head attention mask [num_layers, num_heads] (optional)
+        ffn_mask: FFN mask [num_layers, intermediate_size] (optional)
         
     Returns:
         pruned_model: New model with reduced structure
@@ -103,8 +104,6 @@ def create_structurally_pruned_model(model, config, head_mask, ffn_mask):
     
     # Create a new config with potentially modified dimensions
     new_config = copy.deepcopy(config)
-    
-    # Head pruning would require modifying attention mechanisms more carefully
     
     # Create a new model with the same config (we'll manually prune it)
     is_squad = (hasattr(model.config, 'task_specific_params') and 
@@ -116,13 +115,86 @@ def create_structurally_pruned_model(model, config, head_mask, ffn_mask):
     # Copy the base model weights
     pruned_model.load_state_dict(model.state_dict(), strict=False)
     
-    # Now structurally prune the FFN layers
+    # Get layers for both models
     layers = get_layers(model)
     pruned_layers = get_layers(pruned_model)
     
+    # Prune both attention heads and FFN layers
     for layer_idx in range(len(layers)):
         logger.info(f"Pruning layer {layer_idx}...")
         
+        # ===== ATTENTION HEAD PRUNING =====
+        if head_mask is not None:
+            head_layer_mask = head_mask[layer_idx]  # [num_heads]
+            head_kept_indices = (head_layer_mask > 0).nonzero(as_tuple=True)[0]
+            
+            # Handle edge case: if all heads are pruned, keep at least 1
+            if len(head_kept_indices) == 0:
+                logger.warning(f"  Layer {layer_idx}: All attention heads pruned! Keeping 1 head to avoid breaking model.")
+                head_kept_indices = torch.tensor([0])
+            
+            # Get attention modules
+            orig_attn = get_attn(model, layer_idx)  # self-attention (Q, K, V)
+            orig_mha_proj = get_mha_proj(model, layer_idx)  # output projection
+            pruned_attn = get_attn(pruned_model, layer_idx)
+            pruned_mha_proj = get_mha_proj(pruned_model, layer_idx)
+            
+            # Get dimensions
+            num_heads = config.num_attention_heads
+            head_dim = config.hidden_size // num_heads
+            hidden_size = config.hidden_size
+            
+            # Prune Q, K, V projections (each is [hidden_size, hidden_size])
+            # They are concatenated, so we need to select specific head slices
+            for proj_name in ['query', 'key', 'value']:
+                orig_proj = getattr(orig_attn, proj_name)
+                pruned_proj = getattr(pruned_attn, proj_name)
+                
+                # Original weight: [hidden_size, hidden_size]
+                # Reshaped: [num_heads, head_dim, hidden_size]
+                orig_weight = orig_proj.weight.data.view(num_heads, head_dim, hidden_size)
+                orig_bias = orig_proj.bias.data.view(num_heads, head_dim) if orig_proj.bias is not None else None
+                
+                # Keep only selected heads
+                new_weight = orig_weight[head_kept_indices].reshape(-1, hidden_size)
+                new_bias = orig_bias[head_kept_indices].reshape(-1) if orig_bias is not None else None
+                
+                # Create new linear layer with reduced dimensions
+                new_proj = nn.Linear(hidden_size, len(head_kept_indices) * head_dim, bias=(orig_bias is not None))
+                new_proj.weight.data = new_weight
+                if new_bias is not None:
+                    new_proj.bias.data = new_bias
+                
+                setattr(pruned_attn, proj_name, new_proj)
+            
+            # Prune output projection: [hidden_size, hidden_size]
+            # Input dimension changes (concatenated heads), output stays the same
+            orig_out_weight = orig_mha_proj.dense.weight.data  # [hidden_size, hidden_size]
+            orig_out_bias = orig_mha_proj.dense.bias.data if orig_mha_proj.dense.bias is not None else None
+            
+            # Reshape to separate heads: [hidden_size, num_heads, head_dim]
+            orig_out_weight = orig_out_weight.view(hidden_size, num_heads, head_dim)
+            # Keep only selected heads
+            new_out_weight = orig_out_weight[:, head_kept_indices, :].reshape(hidden_size, -1)
+            
+            new_out_proj = nn.Linear(len(head_kept_indices) * head_dim, hidden_size, 
+                                     bias=(orig_out_bias is not None))
+            new_out_proj.weight.data = new_out_weight
+            if orig_out_bias is not None:
+                new_out_proj.bias.data = orig_out_bias
+            
+            pruned_mha_proj.dense = new_out_proj
+            
+            # Update num_attention_heads so transpose_for_scores works correctly
+            pruned_attn.num_attention_heads = len(head_kept_indices)
+            # Also update all_head_size for consistency
+            pruned_attn.all_head_size = len(head_kept_indices) * head_dim
+            
+            head_sparsity = 1 - len(head_kept_indices) / num_heads
+            logger.info(f"  Layer {layer_idx}: Attention heads {num_heads} -> "
+                       f"{len(head_kept_indices)} (sparsity: {head_sparsity:.1%})")
+        
+        # ===== FFN PRUNING =====
         # Get the original layer modules
         orig_ffn1 = get_ffn1(model, layer_idx)  # intermediate layer
         orig_ffn2 = get_ffn2(model, layer_idx)  # output layer
@@ -178,9 +250,6 @@ def create_structurally_pruned_model(model, config, head_mask, ffn_mask):
         sparsity = 1 - len(intermediate_kept_indices) / orig_ffn1_weight.shape[0]
         logger.info(f"  Layer {layer_idx}: FFN intermediate neurons {orig_ffn1_weight.shape[0]} -> "
                    f"{len(intermediate_kept_indices)} (sparsity: {sparsity:.1%})")
-    
-    # Note: We only structurally prune the intermediate dimension
-    # The ffn_mask is already applied during training via hooks on FFN2
     
     # Count parameters
     orig_params = sum(p.numel() for p in model.parameters())
@@ -253,24 +322,6 @@ def main():
     )
     logger.info(f"Masked model accuracy: {masked_accuracy:.4f}")
     
-    # Create structurally pruned model with masks (using hooks)
-    logger.info("\n" + "="*80)
-    logger.info("Evaluating original model with masks (hook-based)...")
-    logger.info("="*80)
-    
-    if head_mask is not None:
-        head_mask = head_mask.cuda()
-    if ffn_intermediate_mask is not None:
-        ffn_intermediate_mask = ffn_intermediate_mask.cuda()
-    if ffn_output_mask is not None:
-        ffn_output_mask = ffn_output_mask.cuda()
-    
-    # masked_accuracy = test_accuracy(
-    #     model, head_mask, ffn_intermediate_mask, ffn_output_mask, 
-    #     tokenizer, args.task_name
-    # )
-    # logger.info(f"Masked model accuracy: {masked_accuracy:.4f}")
-    
     # Create structurally pruned model
     logger.info("\n" + "="*80)
     logger.info("Creating structurally pruned model...")
@@ -289,7 +340,7 @@ def main():
     logger.info("="*80)
     
     pruned_accuracy = test_accuracy(
-        pruned_model, None, None, None,
+        pruned_model, None, None,
         tokenizer, args.task_name
     )
     logger.info(f"Structurally pruned model accuracy: {pruned_accuracy:.4f}")
