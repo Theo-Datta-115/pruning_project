@@ -11,6 +11,8 @@ from transformers import (
     AutoTokenizer,
 )
 
+from dataset.glue import num_labels as glue_num_labels
+
 
 def load_model_and_tokenizer(
     *,
@@ -46,6 +48,12 @@ def load_model_and_tokenizer(
     is_squad = "squad" in task_name
     base_task_type = "question_answering" if is_squad else "sequence_classification"
     model_cls = AutoModelForQuestionAnswering if is_squad else AutoModelForSequenceClassification
+    
+    # Determine number of labels for the task
+    if is_squad:
+        task_num_labels = None  # QA tasks don't use num_labels
+    else:
+        task_num_labels = glue_num_labels(task_name)
 
     if not use_base_model:
         candidate_dir = ckpt_dir or os.path.join(default_root, model_name, task_name)
@@ -80,7 +88,17 @@ def load_model_and_tokenizer(
             model_source = model_name
 
     config = AutoConfig.from_pretrained(model_source)
-    model = model_cls.from_pretrained(model_source, config=config)
+    
+    # Override num_labels if using base model for sequence classification
+    if use_base_model and task_num_labels is not None:
+        config.num_labels = task_num_labels
+    
+    # Allow mismatched sizes when using base model (e.g., different num_labels)
+    model = model_cls.from_pretrained(
+        model_source, 
+        config=config,
+        ignore_mismatched_sizes=use_base_model
+    )
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, use_auth_token=None)
 
     return config, model, tokenizer, model_source

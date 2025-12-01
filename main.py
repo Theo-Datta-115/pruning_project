@@ -91,10 +91,10 @@ parser.add_argument('--prune', action='store_true', help='Enable pruning with tr
 parser.add_argument('--wandb', action='store_true', help='W&B project name (enables W&B logging if provided)')
 parser.add_argument('--name', type=str, default=None, help='W&B run name (defaults to auto-generated)')
 parser.add_argument('--freeze', action='store_true', help='Freeze the model parameters')
-parser.add_argument('--quantization_loss', type=float, default=0.01, help='Quantization loss weight')
-parser.add_argument('--sparsity_loss', type=float, default=0.1, help='Sparsity loss weight')
+parser.add_argument('--quantization_loss', type=float, default=1.0, help='Quantization loss weight')
+parser.add_argument('--sparsity_loss', type=float, default=1.0, help='Sparsity loss weight')
 parser.add_argument('--hard_init', action='store_true', help='Hard Initialization of the Masks')
-parser.add_argument('--masks_LR', type=float, default=1e-2, help='Learning rate for masks')
+parser.add_argument('--masks_LR', type=float, default=0.05, help='Learning rate for masks')
 parser.add_argument('--learn_masks', type=str, default='ffn', 
                     choices=['head', 'ffn', 'all'],
                     help='Which masks to learn: head, ffn, or all')
@@ -304,8 +304,8 @@ def main():
         # Initialize masks: learned ones get random/hard init, fixed ones get 10 (sigmoid≈1)
         def init_mask(shape, learn):
             if learn and (not args.hard_init) and (args.train_sequential == 'none'):
-                return torch.randn(*shape).cuda()
-                # return torch.ones(*shape).cuda() * logit(torch.tensor(args.keep_percent))
+                # return torch.randn(*shape).cuda()
+                return torch.ones(*shape).cuda() * logit(torch.tensor(args.keep_percent))
             else:
                 return torch.ones(*shape).cuda() * 10
         
