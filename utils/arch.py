@@ -1,6 +1,18 @@
 import torch
 
 
+def logit(x):
+    """Inverse of sigmoid function (log-odds).
+    
+    Args:
+        x: Tensor with values in (0, 1)
+        
+    Returns:
+        logit(x) = log(x / (1 - x))
+    """
+    return torch.log(x / (1 - x))
+
+
 @torch.no_grad()
 def remove_padding(hidden_states, attention_mask):
     attention_mask = attention_mask.view(-1)

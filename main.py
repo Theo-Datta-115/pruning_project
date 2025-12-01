@@ -49,7 +49,7 @@ from evaluate_model.nlp import test_accuracy
 from utils.schedule import get_pruning_schedule, gumbel_sigmoid, get_gumbel_temperature
 from learned_prune.trainable_masks import make_masks_trainable
 from utils.model_loader import load_model_and_tokenizer, unfreeze_layer, unfreeze_model, freeze_model
-from utils.arch import get_attention_param_ratio
+from utils.arch import get_attention_param_ratio, logit
 
 
 logger = logging.getLogger(__name__)
@@ -173,10 +173,20 @@ def compute_mask_losses(model, learn_head, learn_ffn, temperature, layer_order, 
             
             # (weight_factor * torch.abs(torch.mean(mask_sigmoid) - keep_percent))
             
+            # Original quantization loss (centered at 0.5)
+            # mask_clamped = torch.clamp(mask_sigmoid, 1e-7, 1 - 1e-7)
+            # quantization_loss += (weight_factor * torch.mean(
+            #     -torch.log(mask_clamped) * mask_clamped - 
+            #     torch.log(1 - mask_clamped) * (1 - mask_clamped)
+            # ))
+            
             mask_clamped = torch.clamp(mask_sigmoid, 1e-7, 1 - 1e-7)
+            weight_to_one = (1 - keep_percent) 
+            weight_to_zero = keep_percent
+            
             quantization_loss += (weight_factor * torch.mean(
-                -torch.log(mask_clamped) * mask_clamped - 
-                torch.log(1 - mask_clamped) * (1 - mask_clamped)
+                -weight_to_one * torch.log(mask_clamped) * mask_clamped - 
+                weight_to_zero * torch.log(1 - mask_clamped) * (1 - mask_clamped)
             ))
     
     if learn_head:
@@ -294,7 +304,8 @@ def main():
         # Initialize masks: learned ones get random/hard init, fixed ones get 10 (sigmoid≈1)
         def init_mask(shape, learn):
             if learn and (not args.hard_init) and (args.train_sequential == 'none'):
-                return torch.zeros(*shape).cuda()
+                return torch.randn(*shape).cuda()
+                # return torch.ones(*shape).cuda() * logit(torch.tensor(args.keep_percent))
             else:
                 return torch.ones(*shape).cuda() * 10
         
