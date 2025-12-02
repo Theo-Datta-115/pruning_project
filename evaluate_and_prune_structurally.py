@@ -8,7 +8,7 @@ This script:
 4. Evaluates the structurally pruned model
 
 Usage:
-    python evaluate_and_prune_structurally.py --save_name true_50_quantonly --model_name bert-base-uncased --task_name qqp
+    python evaluate_and_prune_structurally.py --save_name mnli_cos_cooldown2 --model_name bert-base-uncased --task_name mnli
 """
 
 import argparse

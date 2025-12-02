@@ -111,6 +111,7 @@ parser.add_argument('--masks_reinit_percent', type=float, default=0.2,
                     help='Percentage of low-value masks to reinitialize (default 0.1 = 10%%)')
 parser.add_argument('--train_sequential', type=str, default='none', choices=['front_to_back', 'back_to_front', 'random', 'none'])
 parser.add_argument('--keep_percent', type=float, default=0.5, help='Keep percentage')
+parser.add_argument('--anneal_quant_loss', action='store_true', help='Use cosine annealing on quantization loss weight')
 
 def reinitialize_low_masks(model, learn_head, learn_ffn, reinit_percent=0.1, threshold=0.5):
     """Reinitialize a random percentage of mask values below threshold.
@@ -419,9 +420,44 @@ def main():
 
     scheduler = LambdaLR(optimizer, lr_lambda=[base_lambda, mask_lambda])
 
+    # Track whether masks have been binarized for frozen epochs
+    masks_binarized = False
+
     for epoch in range(num_training_epochs):
         # Freeze masks during the frozen epochs at the end if pruning is enabled
         is_frozen_epoch = args.prune and (epoch + args.frozen_epochs >= num_training_epochs)
+        
+        # Binarize masks at the start of the first frozen epoch
+        if is_frozen_epoch and not masks_binarized and args.prune:
+            with torch.no_grad():
+                logger.info(f"Binarizing masks at epoch {epoch + 1} (start of frozen epochs)")
+                
+                if learn_head:
+                    # Convert to binary: sigmoid(mask) >= 0.5 -> logit(1.0), else -> logit(0.0)
+                    head_mask_sigmoid = torch.sigmoid(model.trainable_head_mask)
+                    head_mask_binary = (head_mask_sigmoid >= 0.5).float()
+                    # Convert back to logit space: use large values for numerical stability
+                    # logit(1) ≈ large positive, logit(0) ≈ large negative
+                    model.trainable_head_mask.copy_(
+                        torch.where(head_mask_binary > 0.5, 
+                                   torch.tensor(10.0, device=model.trainable_head_mask.device),
+                                   torch.tensor(-10.0, device=model.trainable_head_mask.device))
+                    )
+                    model.trainable_head_mask.requires_grad = False
+                    logger.info(f"Head masks binarized: {head_mask_binary.sum().item()}/{head_mask_binary.numel()} kept")
+                
+                if learn_ffn:
+                    ffn_mask_sigmoid = torch.sigmoid(model.trainable_ffn_mask)
+                    ffn_mask_binary = (ffn_mask_sigmoid >= 0.5).float()
+                    model.trainable_ffn_mask.copy_(
+                        torch.where(ffn_mask_binary > 0.5,
+                                   torch.tensor(10.0, device=model.trainable_ffn_mask.device),
+                                   torch.tensor(-10.0, device=model.trainable_ffn_mask.device))
+                    )
+                    model.trainable_ffn_mask.requires_grad = False
+                    logger.info(f"FFN masks binarized: {ffn_mask_binary.sum().item()}/{ffn_mask_binary.numel()} kept")
+                
+                masks_binarized = True
         
         if args.train_sequential != 'none' and not is_frozen_epoch:
             with torch.no_grad():
@@ -461,7 +497,15 @@ def main():
                 sparsity_loss = torch.tensor(0.0)
                 quantization_loss = torch.tensor(0.0)
 
-            loss = outputs.loss + sparsity_loss * args.sparsity_loss + quantization_loss * args.quantization_loss
+            # Apply cosine annealing to quantization loss weight if enabled
+            if args.anneal_quant_loss:
+                quant_weight = 1 + (args.quantization_loss * (1 - np.cos(np.pi * global_step / total_steps)) / 2)
+                sparsity_weight = quant_weight
+            else:
+                quant_weight = args.quantization_loss
+                sparsity_weight = args.sparsity_loss
+
+            loss = outputs.loss + sparsity_loss * sparsity_weight + quantization_loss * quant_weight
             loss.backward()
             
             optimizer.step()
@@ -477,7 +521,8 @@ def main():
 
             if args.log_loss_every > 0 and global_step % args.log_loss_every == 0:
                 if args.prune:
-                    logger.info(f"Step {global_step}: loss {outputs.loss.item():.4f}, sparsity {sparsity_loss.item():.4f}, quant {quantization_loss.item():.4f}")
+                    quant_log = quant_weight if args.anneal_quant_loss else args.quantization_loss
+                    logger.info(f"Step {global_step}: loss {outputs.loss.item():.4f}, sparsity {sparsity_loss.item():.4f}, quant {quantization_loss.item():.4f}, quant_weight {quant_log:.4f}")
                     
                     if args.wandb:
                         log_dict = {
@@ -486,6 +531,7 @@ def main():
                             "train/quantization_loss": quantization_loss.item(),
                             "train/total_loss": loss.item(),
                             "train/gumbel_temperature": current_temp,
+                            "train/quantization_weight": quant_weight if args.anneal_quant_loss else args.quantization_loss,
                             # "train/learning_rate": scheduler.get_last_lr()[0],
                             "global_step": global_step,
                             "epoch": epoch,
