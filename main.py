@@ -189,9 +189,12 @@ def compute_mask_losses(model, learn_head, learn_ffn, temperature, layer_order, 
                 weight_to_zero * torch.log(1 - mask_clamped) * (1 - mask_clamped)
             ))
     
-    if learn_head:
+    if learn_head and learn_ffn:
         sparsity_loss /= (1 + get_attention_param_ratio(model))
         quantization_loss /= (1 + get_attention_param_ratio(model))
+    elif learn_head:
+        sparsity_loss /= (get_attention_param_ratio(model))
+        quantization_loss /= (get_attention_param_ratio(model))
 
     # Push toward target value, across model
     sparsity_loss = torch.abs(sparsity_loss - keep_percent)
