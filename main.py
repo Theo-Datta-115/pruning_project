@@ -349,9 +349,15 @@ def main():
         mask_params = []
         base_params = [param for param in model.parameters() if param.requires_grad]
 
+    # Use smaller batch size for SST2 and QNLI to prevent overfitting
+    if args.task_name in ['sst2', 'qnli']:
+        train_batch_size = 64
+    else:
+        train_batch_size = 256
+    
     masked_train_dataloader = DataLoader(
         training_dataset,
-        batch_size=256,
+        batch_size=train_batch_size,
         shuffle=True,
         collate_fn=collate_fn,
         pin_memory=True,
@@ -507,6 +513,9 @@ def main():
 
             loss = outputs.loss + sparsity_loss * sparsity_weight + quantization_loss * quant_weight
             loss.backward()
+            
+            # Gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
             optimizer.step()
             scheduler.step()
