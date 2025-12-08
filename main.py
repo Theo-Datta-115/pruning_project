@@ -39,6 +39,12 @@ from transformers import (
 
 from dataset.glue import glue_dataset, max_seq_length, avg_seq_length
 from dataset.squad import squad_dataset
+from dataset.synthetic import (
+    synthetic_dataset, is_synthetic_task, synthetic_max_seq_length, 
+    SYNTHETIC_TASKS, is_synthetic_regression, synthetic_num_classes,
+    uses_float_input, polynomial_collate_fn
+)
+from models.bert_regression import load_bert_for_regression
 from efficiency.mac import compute_mask_mac
 from efficiency.latency import estimate_latency
 from prune.fisher import collect_mask_grads
@@ -66,6 +72,9 @@ parser.add_argument("--task_name", type=str, required=True, choices=[
     "mrpc",
     "squad",
     "squad_v2",
+    "polynomial",
+    "index_sum",
+    "multiindex",
 ])
 parser.add_argument(
     "--ckpt_dir",
@@ -205,8 +214,15 @@ def compute_mask_losses(model, learn_head, learn_ffn, temperature, layer_order, 
 def main():
     args = parser.parse_args()
     IS_SQUAD = "squad" in args.task_name
+    IS_SYNTHETIC = is_synthetic_task(args.task_name)
     IS_LARGE = "large" in args.model_name
-    seq_len = 170 if IS_SQUAD else avg_seq_length(args.task_name)
+    
+    if IS_SYNTHETIC:
+        seq_len = synthetic_max_seq_length(args.task_name)
+    elif IS_SQUAD:
+        seq_len = 170
+    else:
+        seq_len = avg_seq_length(args.task_name)
 
     # Initialize wandb if enabled
     if args.wandb:
@@ -222,14 +238,39 @@ def main():
     else:
         wandb = None
 
-    default_root = "/n/netscratch/sham_lab/Everyone/tdatta/pruning/checkpoints/"
-    config, model, tokenizer, model_source = load_model_and_tokenizer(
-        model_name=args.model_name,
-        task_name=args.task_name,
-        ckpt_dir=args.ckpt_dir,
-        use_base_model=args.use_base_model,
-        default_root=default_root,
-    )
+    # Load model based on task type
+    if IS_SYNTHETIC:
+        if is_synthetic_regression(args.task_name):
+            # Use BERT with regression head for regression synthetic tasks
+            use_floats = uses_float_input(args.task_name)
+            float_seq_len = synthetic_max_seq_length(args.task_name) if use_floats else 1
+            config, model, tokenizer = load_bert_for_regression(
+                args.model_name,
+                use_float_input=use_floats,
+                float_seq_len=float_seq_len,
+            )
+            model_source = "pretrained"
+            if use_floats:
+                logger.info(f"Loaded BERT regression model with float input for: {args.task_name}")
+            else:
+                logger.info(f"Loaded BERT regression model for synthetic task: {args.task_name}")
+        else:
+            # Use BERT with classification head for classification synthetic tasks
+            num_classes = synthetic_num_classes(args.task_name)
+            config = AutoConfig.from_pretrained(args.model_name, num_labels=num_classes)
+            model = AutoModelForSequenceClassification.from_pretrained(args.model_name, config=config)
+            tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+            model_source = "pretrained"
+            logger.info(f"Loaded BERT classification model for synthetic task: {args.task_name} ({num_classes} classes)")
+    else:
+        default_root = "/n/netscratch/sham_lab/Everyone/tdatta/pruning/checkpoints/"
+        config, model, tokenizer, model_source = load_model_and_tokenizer(
+            model_name=args.model_name,
+            task_name=args.task_name,
+            ckpt_dir=args.ckpt_dir,
+            use_base_model=args.use_base_model,
+            default_root=default_root,
+        )
 
     # Create the output directory
     if args.output_dir is None:
@@ -258,9 +299,21 @@ def main():
     set_seed(args.seed)
     logger.info(f"Seed number: {args.seed}")
 
-    # Load the finetuned model and the corresponding tokenizer
     # Load the training dataset
-    if IS_SQUAD:
+    if IS_SYNTHETIC:
+        training_dataset = synthetic_dataset(
+            args.task_name,
+            tokenizer,
+            training=True,
+            num_samples=100000,
+            seed=args.seed,
+        )
+        # Use appropriate collate function based on input type
+        if uses_float_input(args.task_name):
+            collate_fn = polynomial_collate_fn
+        else:
+            collate_fn = DataCollatorWithPadding(tokenizer)
+    elif IS_SQUAD:
         training_dataset = squad_dataset(
             args.task_name,
             tokenizer,
@@ -268,6 +321,7 @@ def main():
             max_seq_len=384,
             pad_to_max=False,
         )
+        collate_fn = DataCollatorWithPadding(tokenizer)
     else:
         training_dataset = glue_dataset(
             args.task_name,
@@ -276,21 +330,22 @@ def main():
             max_seq_len=max_seq_length(args.task_name),
             pad_to_max=False,
         )
+        collate_fn = DataCollatorWithPadding(tokenizer)
 
-    # Sample the examples to be used for search
-    collate_fn = DataCollatorWithPadding(tokenizer)
-    sample_dataset = Subset(
-        training_dataset,
-        np.random.choice(len(training_dataset), args.num_samples).tolist(),
-    )
-    sample_batch_size = int((12 if IS_SQUAD else 32) * (0.5 if IS_LARGE else 1))
-    sample_dataloader = DataLoader(
-        sample_dataset,
-        batch_size=sample_batch_size,
-        collate_fn=collate_fn,
-        shuffle=False,
-        pin_memory=True,
-    )
+    # Sample the examples to be used for search (not needed for synthetic)
+    if not IS_SYNTHETIC:
+        sample_dataset = Subset(
+            training_dataset,
+            np.random.choice(len(training_dataset), args.num_samples).tolist(),
+        )
+        sample_batch_size = int((12 if IS_SQUAD else 32) * (0.5 if IS_LARGE else 1))
+        sample_dataloader = DataLoader(
+            sample_dataset,
+            batch_size=sample_batch_size,
+            collate_fn=collate_fn,
+            shuffle=False,
+            pin_memory=True,
+        )
 
     # Prepare the model
     model = model.cuda()
@@ -588,18 +643,26 @@ def main():
             head_mask = None
             ffn_mask = None
         
-        epoch_test_acc = test_accuracy(model, head_mask, ffn_mask, tokenizer, args.task_name)
-        logger.info(f"Epoch {epoch + 1}/{num_training_epochs} - Test accuracy: {epoch_test_acc:.4f}")
-        # print("counterpoint")
-        # epoch_test_acc = test_accuracy(model, head_mask + 1, ffn_intermediate_mask + 1, ffn_output_mask + 1, tokenizer, args.task_name)
-        # logger.info(f"Epoch {epoch + 1}/{num_training_epochs} - Test accuracy: {epoch_test_acc:.4f}")
+        epoch_test_metric = test_accuracy(model, head_mask, ffn_mask, tokenizer, args.task_name)
         
-        if args.wandb:
-            wandb.log({
-                "eval/accuracy": epoch_test_acc,
-                "epoch": epoch,
-                "global_step": global_step,
-            })
+        if IS_SYNTHETIC and is_synthetic_regression(args.task_name):
+            # For regression synthetic tasks, metric is negative MSE (show positive MSE)
+            logger.info(f"Epoch {epoch + 1}/{num_training_epochs} - Validation MSE: {-epoch_test_metric:.6f}")
+            if args.wandb:
+                wandb.log({
+                    "eval/mse": -epoch_test_metric,
+                    "epoch": epoch,
+                    "global_step": global_step,
+                })
+        else:
+            # Classification tasks (including multiindex)
+            logger.info(f"Epoch {epoch + 1}/{num_training_epochs} - Test accuracy: {epoch_test_metric:.4f}")
+            if args.wandb:
+                wandb.log({
+                    "eval/accuracy": epoch_test_metric,
+                    "epoch": epoch,
+                    "global_step": global_step,
+                })
     
     if args.wandb:
         wandb.finish()
