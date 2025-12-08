@@ -109,7 +109,7 @@ parser.add_argument('--lagrangian_warmup_epochs', type=int, default=2,
                     help='Epochs to warmup lagrangian after prepruning')
 parser.add_argument('--l0_temperature', type=float, default=2./3., 
                     help='Temperature for L0 concrete distribution')
-parser.add_argument('--reg_learning_rate', type=float, default=0.01, 
+parser.add_argument('--reg_learning_rate', type=float, default=2e-5, 
                     help='Learning rate for L0 masks and lambdas')
 
 

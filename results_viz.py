@@ -2,7 +2,7 @@
 Visualize pruning mask distributions from saved model checkpoints.
 
 Usage:
-    python results_viz.py --save_path /n/netscratch/sham_lab/Everyone/tdatta/pruning/outputs/true_50_quantonly --model_name bert-base-uncased --task_name qqp
+    python results_viz.py --save_path /n/netscratch/sham_lab/Everyone/tdatta/pruning/outputs/mnli_cos_cooldown2 --model_name bert-base-uncased --task_name mnli
 """
 
 import argparse
